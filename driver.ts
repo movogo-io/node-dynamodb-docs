@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
+import type { TransactionItem } from '@riddance/docs/driver'
 import { dbRequest } from './lib/aws.js'
 import type { KeyRange } from './schema.js'
 
@@ -284,6 +285,125 @@ class Connection {
         }
     }
 
+    async transact(items: TransactionItem[]) {
+        await this.#transact(items, randomUUID())
+    }
+
+    async #transact(items: TransactionItem[], token: string): Promise<void> {
+        const now = new Date().toISOString()
+        try {
+            await dbRequest(this.#context.env, 'TransactWriteItems', {
+                TransactItems: items.map(item => this.#transactItem(item, now)),
+                ClientRequestToken: token,
+            })
+        } catch (e) {
+            const reasons = cancellationReasons(e)
+            if (reasons) {
+                if (
+                    reasons.some(
+                        r =>
+                            r.Code === 'ConditionalCheckFailed' || r.Code === 'TransactionConflict',
+                    )
+                ) {
+                    throw conflict()
+                }
+                throw e
+            }
+            if (isErrorType(e, 'TransactionInProgressException')) {
+                await setTimeout(1000)
+                return this.#transact(items, token)
+            }
+            if (isErrorType(e, 'ResourceNotFoundException')) {
+                for (const table of new Set(items.map(item => item.table))) {
+                    await this.#createTable(table)
+                }
+                await setTimeout(1000)
+                return this.#transact(items, token)
+            }
+            if (isErrorType(e, 'ResourceInUseException')) {
+                this.#context.log?.debug(
+                    'Table in use; retrying assuming it is being created.',
+                    e,
+                    {
+                        tables: [...new Set(items.map(item => item.table))].join(','),
+                    },
+                )
+                await setTimeout(1000)
+                return this.#transact(items, token)
+            }
+            throw e
+        }
+    }
+
+    #transactItem(item: TransactionItem, now: string) {
+        switch (item.op) {
+            case 'add':
+                return {
+                    Put: {
+                        TableName: this.#tableName(item.table),
+                        Item: {
+                            partition: { S: item.partition },
+                            key: { S: item.key },
+                            revision: { S: item.newRevision as string },
+                            created: { S: now },
+                            updated: { S: now },
+                            seq: { N: '0' },
+                            document: { S: JSON.stringify(item.document) },
+                        },
+                        ConditionExpression: 'attribute_not_exists(revision)',
+                    },
+                }
+            case 'update':
+                return {
+                    Update: {
+                        TableName: this.#tableName(item.table),
+                        Key: {
+                            partition: { S: item.partition },
+                            key: { S: item.key },
+                        },
+                        UpdateExpression:
+                            'ADD seq :one SET revision = :newRevision, updated = :now, document = :document',
+                        ConditionExpression: 'revision = :oldRevision',
+                        ExpressionAttributeValues: {
+                            ':one': { N: '1' },
+                            ':oldRevision': { S: item.revision as string },
+                            ':newRevision': { S: item.newRevision as string },
+                            ':now': { S: now },
+                            ':document': { S: JSON.stringify(item.document) },
+                        },
+                    },
+                }
+            case 'delete':
+                return {
+                    Delete: {
+                        TableName: this.#tableName(item.table),
+                        Key: {
+                            partition: { S: item.partition },
+                            key: { S: item.key },
+                        },
+                        ConditionExpression: 'revision = :oldRevision',
+                        ExpressionAttributeValues: {
+                            ':oldRevision': { S: item.revision as string },
+                        },
+                    },
+                }
+            case 'check':
+                return {
+                    ConditionCheck: {
+                        TableName: this.#tableName(item.table),
+                        Key: {
+                            partition: { S: item.partition },
+                            key: { S: item.key },
+                        },
+                        ConditionExpression: 'revision = :revision',
+                        ExpressionAttributeValues: {
+                            ':revision': { S: item.revision as string },
+                        },
+                    },
+                }
+        }
+    }
+
     close() {
         return Promise.resolve()
     }
@@ -454,5 +574,20 @@ function isErrorType(error: unknown, type: string) {
         return body.__type?.includes(type) ?? false
     } catch {
         return false
+    }
+}
+
+function cancellationReasons(error: unknown) {
+    if (!isErrorType(error, 'TransactionCanceledException')) {
+        return undefined
+    }
+    const { response } = error as { response: { body: string } }
+    try {
+        const body = JSON.parse(response.body) as {
+            CancellationReasons?: { Code?: string }[]
+        }
+        return body.CancellationReasons ?? []
+    } catch {
+        return []
     }
 }
