@@ -1,7 +1,7 @@
 {
   "name": "@riddance/dynamodb-docs",
   "type": "module",
-  "version": "0.0.5",
+  "version": "0.0.4",
   "engines": {
     "node": ">=24"
   },
@@ -16,13 +16,14 @@
     "./test/mock": "./mock.js"
   },
   "scripts": {
+    "prepare": "tsc",
     "start": "riddance-watch",
     "prepack": "riddance-build",
     "prepublishOnly": "riddance-prepublish",
     "postpublish": "riddance-sync"
   },
   "dependencies": {
-    "@riddance/docs": "0.0.5",
+    "@riddance/docs": "git+ssh://git@github.com/movogo-io/node-docs.git#v0.0.4",
     "@riddance/fetch": "0.1.4",
     "@smithy/signature-v4": "5.4.3"
   },

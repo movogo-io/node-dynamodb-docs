@@ -401,6 +401,31 @@ class Connection {
                         },
                     },
                 }
+            case 'put':
+                return {
+                    Put: {
+                        TableName: this.#tableName(item.table),
+                        Item: {
+                            partition: { S: item.partition },
+                            key: { S: item.key },
+                            revision: { S: item.newRevision as string },
+                            created: { S: now },
+                            updated: { S: now },
+                            seq: { N: '0' },
+                            document: { S: JSON.stringify(item.document) },
+                        },
+                    },
+                }
+            case 'clear':
+                return {
+                    Delete: {
+                        TableName: this.#tableName(item.table),
+                        Key: {
+                            partition: { S: item.partition },
+                            key: { S: item.key },
+                        },
+                    },
+                }
         }
     }
 
