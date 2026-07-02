@@ -114,6 +114,48 @@ class Connection {
         }
     }
 
+    async *getPartitions(table: string) {
+        try {
+            let lastEvaluatedKey: unknown
+            const seen = new Set<string>()
+
+            for (;;) {
+                const result = await dbRequest<QueryResponse>(this.#context.env, 'Scan', {
+                    TableName: this.#tableName(table),
+                    ProjectionExpression: '#p',
+                    ExpressionAttributeNames: {
+                        '#p': 'partition',
+                    },
+                    ...(lastEvaluatedKey !== undefined && {
+                        ExclusiveStartKey: lastEvaluatedKey,
+                    }),
+                })
+
+                for (const item of result.Items ?? []) {
+                    const partition = item.partition?.S
+                    if (!partition || seen.has(partition)) {
+                        continue
+                    }
+                    seen.add(partition)
+                    yield partition
+                }
+
+                if (!result.LastEvaluatedKey) {
+                    break
+                }
+                lastEvaluatedKey = result.LastEvaluatedKey
+            }
+        } catch (e) {
+            if (isErrorType(e, 'ResourceNotFoundException')) {
+                return
+            }
+            if (isErrorType(e, 'ResourceInUseException')) {
+                return
+            }
+            throw e
+        }
+    }
+
     async *getPartition(table: string, partition: string, range?: KeyRange) {
         try {
             let lastEvaluatedKey: unknown

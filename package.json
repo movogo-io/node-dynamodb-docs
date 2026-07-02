@@ -1,7 +1,7 @@
 {
   "name": "@riddance/dynamodb-docs",
   "type": "module",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "engines": {
     "node": ">=24"
   },
@@ -22,7 +22,7 @@
     "postpublish": "riddance-sync"
   },
   "dependencies": {
-    "@riddance/docs": "0.0.3",
+    "@riddance/docs": "0.0.4",
     "@riddance/fetch": "0.1.4",
     "@smithy/signature-v4": "5.4.3"
   },
