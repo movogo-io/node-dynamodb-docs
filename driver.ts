@@ -127,18 +127,20 @@ class Connection {
                     ...queryFromRange(partition, range),
                 })
 
-                for (const item of result.Items ?? []) {
-                    const key = item.key?.S
-                    if (!key || (range && !matchRange(range)(key))) {
-                        continue
-                    }
+                if (result.Items !== undefined) {
+                    yield* result.Items.map(item => {
+                        const key = item.key?.S
+                        if (!key || (range && !matchRange(range)(key))) {
+                            return undefined
+                        }
 
-                    yield {
-                        partition: item.partition?.S ?? '',
-                        key,
-                        revision: item.revision?.S as unknown,
-                        document: JSON.parse(item.document?.S ?? '{}') as unknown,
-                    }
+                        return {
+                            partition: item.partition?.S ?? '',
+                            key,
+                            revision: item.revision?.S as unknown,
+                            document: JSON.parse(item.document?.S ?? '{}') as unknown,
+                        }
+                    }).filter(i => !!i)
                 }
 
                 if (!result.LastEvaluatedKey) {
@@ -209,7 +211,7 @@ class Connection {
 
     async delete(table: string, partition: string, key: string, currentRevision?: unknown) {
         try {
-            const deleteParams = {
+            await dbRequest(this.#context.env, 'DeleteItem', {
                 TableName: this.#tableName(table),
                 Key: {
                     partition: { S: partition },
@@ -221,9 +223,7 @@ class Connection {
                         ':oldRevision': { S: currentRevision as string },
                     },
                 }),
-            }
-
-            await dbRequest(this.#context.env, 'DeleteItem', deleteParams)
+            })
         } catch (e) {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
@@ -234,9 +234,8 @@ class Connection {
             if (isErrorType(e, 'ResourceNotFoundException')) {
                 if (currentRevision) {
                     throw conflict()
-                } else {
-                    return
                 }
+                return
             }
             throw e
         }
@@ -374,9 +373,8 @@ function matchRange(range?: KeyRange) {
         if (after) {
             if (before) {
                 return (key: string) => after <= key && key < before
-            } else {
-                return (key: string) => after <= key
             }
+            return (key: string) => after <= key
         }
         if (before) {
             return (key: string) => key < before
@@ -400,7 +398,7 @@ function notFound() {
 }
 
 function isErrorType(error: unknown, type: string) {
-    if (!(error instanceof Error)) {
+    if (!Error.isError(error)) {
         return false
     }
     if (!('response' in error)) {

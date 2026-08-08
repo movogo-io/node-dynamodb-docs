@@ -35,7 +35,7 @@ export async function localAwsEnv(region?: string, profile?: string): Promise<Lo
             .split('\n')
             .map(line => line.trim())
             .filter(line => !!line && !line.startsWith('#'))
-    // eslint-disable-next-line require-atomic-updates
+    // eslint-disable-next-line require-atomic-updates, unicorn/no-top-level-assignment-in-function
     cachedConfigLines = configLines
 
     let sectionBeginIx = -1
@@ -124,7 +124,7 @@ async function awsStringRequest<T>(
         body,
     })
     return await fetchJson<T>(
-        uri.toString(),
+        uri,
         {
             method,
             headers,
