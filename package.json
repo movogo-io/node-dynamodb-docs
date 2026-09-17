@@ -1,7 +1,7 @@
 {
   "name": "@movogo-io/dynamodb-docs",
   "type": "module",
-  "version": "0.0.5",
+  "version": "0.1.0",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
@@ -33,7 +33,7 @@
     "postpublish": "riddance-sync"
   },
   "dependencies": {
-    "@riddance/docs": "npm:@movogo-io/docs@^0.0.5",
+    "@movogo-io/docs": "^0.1.0",
     "@riddance/fetch": "0.1.5",
     "@smithy/signature-v4": "5.6.12"
   },

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
-import type { TransactionItem } from '@riddance/docs/driver'
+import type { TransactionItem } from '@movogo-io/docs/driver'
 import { dbRequest } from './lib/aws.js'
 import type { KeyRange } from './schema.js'
 
