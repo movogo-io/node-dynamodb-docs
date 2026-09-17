@@ -18,6 +18,9 @@
     "*.d.ts",
     "lib/*.d.ts"
   ],
+  "sideEffects": [
+    "./partitioned.js"
+  ],
   "exports": {
     ".": "./partitioned.js",
     "./schema": "./schema.js",
@@ -31,10 +34,13 @@
   },
   "dependencies": {
     "@riddance/docs": "npm:@movogo-io/docs@^0.0.5",
-    "@riddance/fetch": "0.1.4",
-    "@smithy/signature-v4": "5.4.3"
+    "@riddance/fetch": "0.1.5",
+    "@smithy/signature-v4": "5.6.12"
   },
   "devDependencies": {
-    "@riddance/env": "0.10.0"
+    "@riddance/env": "0.10.2"
+  },
+  "allowScripts": {
+    "@riddance/env": true
   }
 }
