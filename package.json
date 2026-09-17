@@ -1,7 +1,7 @@
 {
   "name": "@movogo-io/dynamodb-docs",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
@@ -16,14 +16,23 @@
     "*.js",
     "lib/*.js",
     "*.d.ts",
-    "lib/*.d.ts"
+    "lib/*.d.ts",
+    "instructions.md"
   ],
   "sideEffects": [
-    "./partitioned.js"
+    "./partitioned.js",
+    "./indexed.js",
+    "./driver.js",
+    "./lib/install.js"
   ],
   "exports": {
     ".": "./partitioned.js",
+    "./indexed": "./indexed.js",
+    "./driver": "./driver.js",
     "./schema": "./schema.js"
+  },
+  "ai": {
+    "instructions": "./instructions.md"
   },
   "scripts": {
     "start": "riddance-watch",
@@ -32,11 +41,14 @@
     "postpublish": "riddance-sync"
   },
   "dependencies": {
-    "@movogo-io/docs": "^0.1.0",
     "@riddance/fetch": "0.1.5",
     "@smithy/signature-v4": "5.6.12"
   },
+  "peerDependencies": {
+    "@movogo-io/docs": "^0.1.0"
+  },
   "devDependencies": {
+    "@movogo-io/docs": "0.1.0",
     "@riddance/env": "0.10.2"
   },
   "allowScripts": {

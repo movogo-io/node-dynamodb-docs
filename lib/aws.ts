@@ -10,6 +10,7 @@ export type LocalEnv = {
     AWS_ACCESS_KEY_ID: string
     AWS_SECRET_ACCESS_KEY: string
     AWS_SESSION_TOKEN?: string
+    AWS_DYNAMODB_ENDPOINT?: string
 }
 
 let cachedConfigLines: string[] | undefined
@@ -21,8 +22,15 @@ export async function localAwsEnv(region?: string, profile?: string): Promise<Lo
         AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
         AWS_SESSION_TOKEN: process.env.AWS_SESSION_TOKEN,
     }
+    const { AWS_DYNAMODB_ENDPOINT } = process.env
     if (AWS_REGION && AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY) {
-        return { AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN }
+        return {
+            AWS_REGION,
+            AWS_ACCESS_KEY_ID,
+            AWS_SECRET_ACCESS_KEY,
+            AWS_SESSION_TOKEN,
+            AWS_DYNAMODB_ENDPOINT,
+        }
     }
     const configLines =
         cachedConfigLines ??
@@ -61,20 +69,27 @@ export async function localAwsEnv(region?: string, profile?: string): Promise<Lo
     if (!AWS_REGION || !AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY) {
         throw new Error('Incomplete AWS credentials file.')
     }
-    return { AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN }
+    return {
+        AWS_REGION,
+        AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY,
+        AWS_SESSION_TOKEN,
+        AWS_DYNAMODB_ENDPOINT,
+    }
 }
 
 export function dbRequest<T>(env: Partial<LocalEnv> | undefined, target: string, body: unknown) {
+    const region = env?.AWS_REGION ?? missing('AWS_REGION')
     return awsStringRequest<T>(
         {
-            AWS_REGION: env?.AWS_REGION ?? missing('AWS_REGION'),
+            AWS_REGION: region,
             AWS_ACCESS_KEY_ID: env?.AWS_ACCESS_KEY_ID ?? missing('AWS_ACCESS_KEY_ID'),
             AWS_SECRET_ACCESS_KEY: env?.AWS_SECRET_ACCESS_KEY ?? missing('AWS_SECRET_ACCESS_KEY'),
             AWS_SESSION_TOKEN: env?.AWS_SESSION_TOKEN,
         },
         'POST',
         'dynamodb',
-        '/',
+        env?.AWS_DYNAMODB_ENDPOINT ?? `https://dynamodb.${region}.amazonaws.com/`,
         JSON.stringify(body),
         'application/json',
         'DynamoDB_20120810.' + target,
@@ -89,7 +104,7 @@ async function awsStringRequest<T>(
     env: LocalEnv,
     method: string,
     service: string,
-    path: string,
+    endpoint: string,
     body: string,
     contentType: string,
     target: string,
@@ -104,19 +119,19 @@ async function awsStringRequest<T>(
             sessionToken: env.AWS_SESSION_TOKEN,
         },
     })
-    const uri = new URL(`https://${service}.${env.AWS_REGION}.amazonaws.com${path}`)
+    const uri = new URL(endpoint)
     const query: { [key: string]: string } = {}
     uri.searchParams.forEach((value, key) => {
         query[key] = value
     })
     const { headers } = await signer.sign({
         method,
-        protocol: 'https:',
+        protocol: uri.protocol,
         hostname: uri.hostname,
         path: uri.pathname,
         query,
         headers: {
-            host: uri.hostname,
+            host: uri.host,
             'content-type': contentType,
             accept: 'application/json',
             ...(target && { 'X-Amz-Target': target }),

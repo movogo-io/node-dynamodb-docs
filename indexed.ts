@@ -1,4 +1,3 @@
 import './lib/install.js'
 
-export * from '@movogo-io/docs'
 export * from '@movogo-io/docs/indexed'
