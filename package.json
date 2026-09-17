@@ -23,8 +23,7 @@
   ],
   "exports": {
     ".": "./partitioned.js",
-    "./schema": "./schema.js",
-    "./test/mock": "./mock.js"
+    "./schema": "./schema.js"
   },
   "scripts": {
     "start": "riddance-watch",

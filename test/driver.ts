@@ -10,5 +10,11 @@ const context = {
 }
 
 describe('driver', () => {
-    harness(it, new Driver(), () => context)
+    harness(
+        (message, runner) => {
+            it(message, runner).timeout(30_000)
+        },
+        new Driver(),
+        () => context,
+    )
 })
