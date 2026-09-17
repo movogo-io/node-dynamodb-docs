@@ -1,7 +1,7 @@
 {
   "name": "@movogo-io/dynamodb-docs",
   "type": "module",
-  "version": "0.1.1",
+  "version": "0.1.0",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
@@ -16,8 +16,7 @@
     "*.js",
     "lib/*.js",
     "*.d.ts",
-    "lib/*.d.ts",
-    "instructions.md"
+    "lib/*.d.ts"
   ],
   "sideEffects": [
     "./partitioned.js",
@@ -30,9 +29,6 @@
     "./indexed": "./indexed.js",
     "./driver": "./driver.js",
     "./schema": "./schema.js"
-  },
-  "ai": {
-    "instructions": "./instructions.md"
   },
   "scripts": {
     "start": "riddance-watch",

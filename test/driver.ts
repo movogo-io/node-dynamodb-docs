@@ -13,6 +13,8 @@ const context: { env: LocalEnv & { TABLE_PREFIX: string }; on?: undefined } = {
     },
 }
 
+const now = 4_000_000_000
+
 type Schema = {
     IndexTestDocs: { [partition: string]: { [key: string]: { unitId: string } } }
 }
@@ -34,70 +36,78 @@ describe('driver', () => {
         () => context,
     )
 
-    it('rejects expiresAt in milliseconds', async () => {
-        const connection = await new Driver().connect(context)
-        await assert.rejects(
-            connection.add('TtlTestDocs', randomUUID(), randomUUID(), {
-                expiresAt: Date.UTC(2030, 0, 1),
-            }),
-            /epoch seconds/u,
-        )
-    })
-
-    it('projects numeric expiresAt to a top-level attribute', async () => {
+    it('stores the expiry as a numeric top-level attribute', async () => {
         const connection = await new Driver().connect(context)
         const partition = randomUUID()
         const key = randomUUID()
-        const revision = await connection.add('TtlTestDocs', partition, key, {
-            expiresAt: 1_893_456_000,
-        })
+        const revision = await connection.add(
+            'TtlTestDocs',
+            partition,
+            key,
+            { data: 'x' },
+            { now, expiresAt: now + 60 },
+        )
 
         assert.deepStrictEqual(await rawItem(partition, key), {
-            expiresAt: { N: '1893456000' },
-            document: { S: '{"expiresAt":1893456000}' },
+            expiresAt: { N: '4000000060' },
+            document: { S: '{"data":"x"}' },
         })
 
-        const updatedRevision = await connection.update('TtlTestDocs', partition, key, revision, {
-            expiresAt: 1_893_542_400,
-        })
+        const updatedRevision = await connection.update(
+            'TtlTestDocs',
+            partition,
+            key,
+            revision,
+            { data: 'y' },
+            { now, expiresAt: now + 120 },
+        )
         assert.deepStrictEqual(await rawItem(partition, key), {
-            expiresAt: { N: '1893542400' },
-            document: { S: '{"expiresAt":1893542400}' },
+            expiresAt: { N: '4000000120' },
+            document: { S: '{"data":"y"}' },
         })
 
-        await connection.update('TtlTestDocs', partition, key, updatedRevision, {
-            expiresAt: '2030-01-01T00:00:00Z',
-        })
+        await connection.update(
+            'TtlTestDocs',
+            partition,
+            key,
+            updatedRevision,
+            { data: 'z' },
+            { now },
+        )
         assert.deepStrictEqual(await rawItem(partition, key), {
             expiresAt: undefined,
-            document: { S: '{"expiresAt":"2030-01-01T00:00:00Z"}' },
+            document: { S: '{"data":"z"}' },
         })
     }).timeout(60_000)
 
-    it('projects expiresAt from transactions', async () => {
+    it('stores the expiry from transactions', async () => {
         const connection = await new Driver().connect(context)
         const partition = randomUUID()
         const key = randomUUID()
-        await connection.transact([
-            {
-                op: 'put',
-                table: 'TtlTestDocs',
-                partition,
-                key,
-                document: { expiresAt: 1_893_456_000 },
-                newRevision: randomUUID(),
-            },
-        ])
+        await connection.transact(
+            [
+                {
+                    op: 'put',
+                    table: 'TtlTestDocs',
+                    partition,
+                    key,
+                    document: { data: 'x' },
+                    newRevision: randomUUID(),
+                    expiresAt: now + 60,
+                },
+            ],
+            { now },
+        )
 
         assert.deepStrictEqual(await rawItem(partition, key), {
-            expiresAt: { N: '1893456000' },
-            document: { S: '{"expiresAt":1893456000}' },
+            expiresAt: { N: '4000000060' },
+            document: { S: '{"data":"x"}' },
         })
     }).timeout(60_000)
 
     it('enables time to live on created tables', async () => {
         const connection = await new Driver().connect(context)
-        await connection.add('TtlTestDocs', randomUUID(), randomUUID(), {})
+        await connection.add('TtlTestDocs', randomUUID(), randomUUID(), {}, { now })
 
         const { TimeToLiveDescription } = await dbRequest<{
             TimeToLiveDescription?: { AttributeName?: string; TimeToLiveStatus?: string }
@@ -152,7 +162,7 @@ describe('driver', () => {
         const partition = randomUUID()
         const filler = 'x'.repeat(250_000)
         for (const key of ['03', '01', '05', '02', '04']) {
-            await connection.add('LargeTestDocs', partition, key, { key, filler })
+            await connection.add('LargeTestDocs', partition, key, { key, filler }, { now })
         }
 
         const rows = await Array.fromAsync(connection.getPartition('LargeTestDocs', partition))

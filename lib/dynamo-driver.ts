@@ -37,7 +37,8 @@ const backoffDelayMsBase = 100
 const backoffDelayMsMax = 3200
 const tableCreationAttemptsMax = 60
 const tableCreationDelayMs = 1000
-const expiresAtMax = 100_000_000_000
+
+type WriteOptions = { now: number; expiresAt?: number }
 
 class Connection {
     readonly #context
@@ -46,7 +47,13 @@ class Connection {
         this.#context = context
     }
 
-    async add(table: string, partition: string, key: string, document: unknown): Promise<unknown> {
+    async add(
+        table: string,
+        partition: string,
+        key: string,
+        document: unknown,
+        options: WriteOptions,
+    ): Promise<unknown> {
         const revision = randomUUID().replaceAll('-', '')
         try {
             await this.#request('PutItem', {
@@ -56,15 +63,16 @@ class Connection {
                     key,
                     revision,
                     document,
+                    options.expiresAt,
                     new Date().toISOString(),
                 ),
-                ConditionExpression: 'attribute_not_exists(revision)',
+                ...absentOrExpiredCondition(options.now),
             })
         } catch (e) {
             if (isErrorType(e, 'ResourceNotFoundException')) {
                 await this.#createTable(table)
                 await setTimeout(tableCreationDelayMs)
-                return this.add(table, partition, key, document)
+                return this.add(table, partition, key, document, options)
             }
             if (isErrorType(e, 'ResourceInUseException')) {
                 this.#context.log?.debug(
@@ -75,7 +83,7 @@ class Connection {
                     },
                 )
                 await setTimeout(tableCreationDelayMs)
-                return this.add(table, partition, key, document)
+                return this.add(table, partition, key, document, options)
             }
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
@@ -105,6 +113,7 @@ class Connection {
                 key,
                 revision: result.Item.revision?.S as unknown,
                 document: JSON.parse(result.Item.document?.S ?? '{}') as unknown,
+                ...expiresAtOf(result.Item),
             }
         } catch (e) {
             if (isErrorType(e, 'ResourceNotFoundException')) {
@@ -162,6 +171,9 @@ class Connection {
     }
 
     async *getPartition(table: string, partition: string, range?: KeyRange) {
+        if (range && 'before' in range && range.before === '') {
+            return
+        }
         try {
             let lastEvaluatedKey: unknown
 
@@ -186,6 +198,7 @@ class Connection {
                             key,
                             revision: item.revision?.S as unknown,
                             document: JSON.parse(item.document?.S ?? '{}') as unknown,
+                            ...expiresAtOf(item),
                         }
                     }).filter(i => !!i)
                 }
@@ -212,6 +225,7 @@ class Connection {
         key: string,
         currentRevision: unknown,
         document: unknown,
+        options: WriteOptions,
     ): Promise<unknown> {
         const newRevision = randomUUID().replaceAll('-', '')
         try {
@@ -224,6 +238,7 @@ class Connection {
                     currentRevision,
                     newRevision,
                     document,
+                    options,
                     new Date().toISOString(),
                 ),
             )
@@ -240,7 +255,7 @@ class Connection {
                     },
                 )
                 await setTimeout(tableCreationDelayMs)
-                return this.update(table, partition, key, currentRevision, document)
+                return this.update(table, partition, key, currentRevision, document, options)
             }
             if (isErrorType(e, 'ResourceNotFoundException')) {
                 throw conflict()
@@ -250,33 +265,36 @@ class Connection {
         return newRevision
     }
 
-    async delete(table: string, partition: string, key: string, currentRevision?: unknown) {
+    async delete(
+        table: string,
+        partition: string,
+        key: string,
+        currentRevision: unknown,
+        options: { now: number },
+    ) {
         try {
-            await this.#request(
-                'DeleteItem',
-                deleteItem(this.#tableName(table), partition, key, currentRevision),
-            )
+            await this.#request('DeleteItem', {
+                ...deleteItem(this.#tableName(table), partition, key),
+                ...liveRevisionCondition(currentRevision, options.now),
+            })
         } catch (e) {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
             }
             if (isErrorType(e, 'ResourceInUseException')) {
-                return
+                throw conflict()
             }
             if (isErrorType(e, 'ResourceNotFoundException')) {
-                if (currentRevision) {
-                    throw conflict()
-                }
-                return
+                throw conflict()
             }
             throw e
         }
     }
 
-    async transact(items: TransactionItem[]) {
-        const now = new Date().toISOString()
+    async transact(items: TransactionItem[], options: { now: number }) {
+        const timestamp = new Date().toISOString()
         const request = {
-            TransactItems: items.map(item => this.#transactItem(item, now)),
+            TransactItems: items.map(item => this.#transactItem(item, options.now, timestamp)),
             ClientRequestToken: randomUUID(),
         }
         for (let attempt = 1; ; attempt++) {
@@ -330,7 +348,7 @@ class Connection {
         throw e
     }
 
-    #transactItem(item: TransactionItem, now: string) {
+    #transactItem(item: TransactionItem, nowSeconds: number, timestamp: string) {
         const tableName = this.#tableName(item.table)
         switch (item.op) {
             case 'add':
@@ -342,9 +360,10 @@ class Connection {
                             item.key,
                             item.newRevision,
                             item.document,
-                            now,
+                            item.expiresAt,
+                            timestamp,
                         ),
-                        ConditionExpression: 'attribute_not_exists(revision)',
+                        ...absentOrExpiredCondition(nowSeconds),
                     },
                 }
             case 'put':
@@ -355,7 +374,8 @@ class Connection {
                         item.key,
                         item.newRevision,
                         item.document,
-                        now,
+                        item.expiresAt,
+                        timestamp,
                     ),
                 }
             case 'update':
@@ -367,12 +387,16 @@ class Connection {
                         item.revision,
                         item.newRevision,
                         item.document,
-                        now,
+                        { now: nowSeconds, expiresAt: item.expiresAt },
+                        timestamp,
                     ),
                 }
             case 'delete':
                 return {
-                    Delete: deleteItem(tableName, item.partition, item.key, item.revision),
+                    Delete: {
+                        ...deleteItem(tableName, item.partition, item.key),
+                        ...liveRevisionCondition(item.revision, nowSeconds),
+                    },
                 }
             case 'clear':
                 return {
@@ -383,7 +407,7 @@ class Connection {
                     ConditionCheck: {
                         TableName: tableName,
                         Key: itemKey(item.partition, item.key),
-                        ...revisionCondition(item.revision),
+                        ...liveRevisionCondition(item.revision, nowSeconds),
                     },
                 }
         }
@@ -493,47 +517,29 @@ function putItem(
     key: string,
     revision: unknown,
     document: unknown,
-    now: string,
+    expiresAt: number | undefined,
+    timestamp: string,
 ) {
     return {
         TableName: tableName,
         Item: {
             ...itemKey(partition, key),
             revision: { S: revision as string },
-            created: { S: now },
-            updated: { S: now },
+            created: { S: timestamp },
+            updated: { S: timestamp },
             seq: { N: '0' },
             document: { S: JSON.stringify(document) },
-            ...expiresAtAttributeOf(document),
+            ...(expiresAt !== undefined && { expiresAt: { N: expiresAt.toString() } }),
         },
     }
 }
 
-function expiresAtAttributeOf(document: unknown) {
-    const expiresAt = expiresAtOf(document)
-    if (expiresAt === undefined) {
+function expiresAtOf(item: { expiresAt?: AttributeValue }) {
+    const seconds = item.expiresAt?.N
+    if (seconds === undefined) {
         return {}
     }
-    return { expiresAt: { N: expiresAt.toString() } }
-}
-
-function expiresAtOf(document: unknown) {
-    if (typeof document !== 'object' || document === null) {
-        return undefined
-    }
-    if (!('expiresAt' in document)) {
-        return undefined
-    }
-    const { expiresAt } = document
-    if (typeof expiresAt !== 'number') {
-        return undefined
-    }
-    if (!Number.isSafeInteger(expiresAt) || expiresAt < 0 || expiresAtMax <= expiresAt) {
-        throw new Error(
-            `expiresAt must be a non-negative integer of epoch seconds below ${expiresAtMax}, got ${expiresAt}.`,
-        )
-    }
-    return expiresAt
+    return { expiresAt: Number(seconds) }
 }
 
 function updateItem(
@@ -543,46 +549,59 @@ function updateItem(
     revision: unknown,
     newRevision: unknown,
     document: unknown,
-    now: string,
+    options: WriteOptions,
+    timestamp: string,
 ) {
-    const expiresAt = expiresAtOf(document)
+    const condition = liveRevisionCondition(revision, options.now)
     return {
         TableName: tableName,
         Key: itemKey(partition, key),
-        UpdateExpression: updateExpression(expiresAt),
-        ConditionExpression: 'revision = :oldRevision',
+        UpdateExpression: updateExpression(options.expiresAt),
+        ConditionExpression: condition.ConditionExpression,
         ExpressionAttributeValues: {
+            ...condition.ExpressionAttributeValues,
             ':one': { N: '1' },
-            ':oldRevision': { S: revision as string },
             ':newRevision': { S: newRevision as string },
-            ':now': { S: now },
+            ':updated': { S: timestamp },
             ':document': { S: JSON.stringify(document) },
-            ...(expiresAt !== undefined && { ':expiresAt': { N: expiresAt.toString() } }),
+            ...(options.expiresAt !== undefined && {
+                ':expiresAt': { N: options.expiresAt.toString() },
+            }),
         },
     }
 }
 
 function updateExpression(expiresAt: number | undefined) {
-    const set = 'ADD seq :one SET revision = :newRevision, updated = :now, document = :document'
+    const set = 'ADD seq :one SET revision = :newRevision, updated = :updated, document = :document'
     if (expiresAt === undefined) {
         return `${set} REMOVE expiresAt`
     }
     return `${set}, expiresAt = :expiresAt`
 }
 
-function deleteItem(tableName: string, partition: string, key: string, revision?: unknown) {
+function deleteItem(tableName: string, partition: string, key: string) {
     return {
         TableName: tableName,
         Key: itemKey(partition, key),
-        ...(revision !== undefined && revisionCondition(revision)),
     }
 }
 
-function revisionCondition(revision: unknown) {
+function absentOrExpiredCondition(nowSeconds: number) {
     return {
-        ConditionExpression: 'revision = :oldRevision',
+        ConditionExpression: 'attribute_not_exists(revision) OR expiresAt <= :nowSeconds',
+        ExpressionAttributeValues: {
+            ':nowSeconds': { N: nowSeconds.toString() },
+        },
+    }
+}
+
+function liveRevisionCondition(revision: unknown, nowSeconds: number) {
+    return {
+        ConditionExpression:
+            'revision = :oldRevision AND (attribute_not_exists(expiresAt) OR :nowSeconds < expiresAt)',
         ExpressionAttributeValues: {
             ':oldRevision': { S: revision as string },
+            ':nowSeconds': { N: nowSeconds.toString() },
         },
     }
 }
@@ -620,30 +639,36 @@ function queryFromRange(partition: string, range?: KeyRange) {
         }
     }
     if ('before' in range || 'after' in range) {
-        const terms = ['#p = :p']
-        if (range.after) {
-            if (range.before) {
-                terms.push('#k between :after and :before')
-            } else {
-                terms.push(':after <= #k')
-            }
-        } else if (range.before) {
-            terms.push('#k < :before')
+        // Every key is at or after '', and DynamoDB rejects an empty key condition value.
+        const after = range.after === '' ? undefined : range.after
+        const { before } = range
+        if (after === undefined && before === undefined) {
+            return queryFromRange(partition)
         }
         return {
-            KeyConditionExpression: terms.join(' and '),
+            KeyConditionExpression: `#p = :p and ${keyCondition(after, before)}`,
             ExpressionAttributeNames: {
                 '#p': 'partition',
                 '#k': 'key',
             },
             ExpressionAttributeValues: {
                 ':p': { S: partition },
-                ':before': range.before && { S: range.before },
-                ':after': range.after && { S: range.after },
+                ...(before !== undefined && { ':before': { S: before } }),
+                ...(after !== undefined && { ':after': { S: after } }),
             },
         }
     }
     throw new Error('Unsupported range.')
+}
+
+function keyCondition(after: string | undefined, before: string | undefined) {
+    if (after === undefined) {
+        return '#k < :before'
+    }
+    if (before === undefined) {
+        return ':after <= #k'
+    }
+    return '#k between :after and :before'
 }
 
 function matchRange(range?: KeyRange) {
@@ -655,13 +680,13 @@ function matchRange(range?: KeyRange) {
     }
     if ('before' in range || 'after' in range) {
         const { after, before } = range
-        if (after) {
-            if (before) {
+        if (after !== undefined) {
+            if (before !== undefined) {
                 return (key: string) => after <= key && key < before
             }
             return (key: string) => after <= key
         }
-        if (before) {
+        if (before !== undefined) {
             return (key: string) => key < before
         }
     }
@@ -678,15 +703,11 @@ async function backoff(attempt: number) {
 }
 
 function conflict() {
-    const e = new Error('Conflict')
-    ;(e as unknown as { status: number }).status = 409
-    return e
+    return Object.assign(new Error('Conflict'), { status: 409, statusCode: 409 })
 }
 
 function notFound() {
-    const e = new Error('Not found')
-    ;(e as unknown as { status: number }).status = 404
-    return e
+    return Object.assign(new Error('Not found'), { status: 404, statusCode: 404 })
 }
 
 function isThrottledRequest(error: unknown) {
