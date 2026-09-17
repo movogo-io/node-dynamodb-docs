@@ -30,6 +30,7 @@ type Environment = {
     AWS_DYNAMODB_BILLING_METHOD?: string
     AWS_DYNAMODB_RCU?: string
     AWS_DYNAMODB_WCU?: string
+    AWS_DYNAMODB_POINT_IN_TIME_RECOVERY?: string
 }
 
 const throttleAttemptsMax = 8
@@ -464,6 +465,30 @@ class Connection {
             TableName: this.#tableName(table),
             TimeToLiveSpecification: { AttributeName: 'expiresAt', Enabled: true },
         })
+        if (this.#context.env?.AWS_DYNAMODB_POINT_IN_TIME_RECOVERY === 'true') {
+            await this.#enablePointInTimeRecovery(table)
+        }
+    }
+
+    // Continuous backups keep being provisioned for a few seconds after the table is active.
+    async #enablePointInTimeRecovery(table: string) {
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await this.#request('UpdateContinuousBackups', {
+                    TableName: this.#tableName(table),
+                    PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true },
+                })
+                return
+            } catch (e) {
+                if (
+                    tableCreationAttemptsMax <= attempt ||
+                    !isErrorType(e, 'ContinuousBackupsUnavailableException')
+                ) {
+                    throw e
+                }
+                await setTimeout(tableCreationDelayMs)
+            }
+        }
     }
 
     async #waitForActive(table: string) {

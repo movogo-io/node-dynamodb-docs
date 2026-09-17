@@ -120,6 +120,40 @@ describe('driver', () => {
         )
     }).timeout(60_000)
 
+    it('enables point-in-time recovery on created tables when configured', async () => {
+        const connection = await new Driver().connect({
+            env: { ...context.env, AWS_DYNAMODB_POINT_IN_TIME_RECOVERY: 'true' },
+        })
+        await connection.add('PitrTestDocs', randomUUID(), randomUUID(), {}, { now })
+
+        const { ContinuousBackupsDescription } = await dbRequest<{
+            ContinuousBackupsDescription?: {
+                PointInTimeRecoveryDescription?: { PointInTimeRecoveryStatus?: string }
+            }
+        }>(context.env, 'DescribeContinuousBackups', { TableName: 'DocsTests.PitrTestDocs' })
+
+        assert.strictEqual(
+            ContinuousBackupsDescription?.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus,
+            'ENABLED',
+        )
+    }).timeout(60_000)
+
+    it('leaves point-in-time recovery off by default', async () => {
+        const connection = await new Driver().connect(context)
+        await connection.add('TtlTestDocs', randomUUID(), randomUUID(), {}, { now })
+
+        const { ContinuousBackupsDescription } = await dbRequest<{
+            ContinuousBackupsDescription?: {
+                PointInTimeRecoveryDescription?: { PointInTimeRecoveryStatus?: string }
+            }
+        }>(context.env, 'DescribeContinuousBackups', { TableName: 'DocsTests.TtlTestDocs' })
+
+        assert.strictEqual(
+            ContinuousBackupsDescription?.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus,
+            'DISABLED',
+        )
+    }).timeout(60_000)
+
     it('moves index entries when the indexed value changes', async () => {
         const previous = setDriver(new Driver())
         try {

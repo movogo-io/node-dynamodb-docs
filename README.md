@@ -10,6 +10,7 @@ The driver reads these from the context's `env`:
 - `AWS_DYNAMODB_ENDPOINT`: optional full URL overriding the regional endpoint, e.g. `http://localhost:8000/` for DynamoDB Local.
 - `TABLE_PREFIX` / `TABLE_POSTFIX`: wrapped around every schema table name, e.g. `staging.Rentals`.
 - `AWS_DYNAMODB_BILLING_METHOD`: `PROVISIONED` with `AWS_DYNAMODB_RCU` / `AWS_DYNAMODB_WCU`, otherwise pay per request.
+- `AWS_DYNAMODB_POINT_IN_TIME_RECOVERY`: `true` enables point-in-time recovery on every table the driver creates. Like time to live, it is only applied on creation; enable it on existing tables once with `aws dynamodb update-continuous-backups --table-name <name> --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`.
 
 Tables are created on first write, so no provisioning step is needed. A table's first write waits for the table to become active, which takes several seconds.
 
