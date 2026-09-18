@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { createServer } from 'node:http'
 import { setDriver } from '@movogo-io/docs/driver'
 import { docs } from '@movogo-io/docs/indexed'
 import { harness } from '@movogo-io/docs/test/harness'
@@ -35,6 +36,134 @@ describe('driver', () => {
         new Driver(),
         () => context,
     )
+
+    it('rejects a read consistency it does not know', async () => {
+        await assert.rejects(
+            new Driver().connect({
+                env: { ...context.env, AWS_DYNAMODB_READ_CONSISTENCY: 'strong' },
+            }),
+            { message: "AWS_DYNAMODB_READ_CONSISTENCY must be STRONG or EVENTUAL, not 'strong'." },
+        )
+    })
+
+    it('reads eventually consistently unless told otherwise', async () => {
+        const mock = await createMockDynamo()
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+            await connection.get('Docs', 'p', 'k')
+            await connection.getMany('Docs', [{ partition: 'p', key: 'k' }])
+            await Array.fromAsync(connection.getPartition('Docs', 'p'))
+            await Array.fromAsync(connection.getPartitions('Docs'))
+
+            assert.deepStrictEqual(mock.requests, [
+                {
+                    target: 'DynamoDB_20120810.GetItem',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        Key: { partition: { S: 'p' }, key: { S: 'k' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.BatchGetItem',
+                    body: {
+                        RequestItems: {
+                            'Mock.Docs': { Keys: [{ partition: { S: 'p' }, key: { S: 'k' } }] },
+                        },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.Query',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        KeyConditionExpression: '#p = :p',
+                        ExpressionAttributeNames: { '#p': 'partition' },
+                        ExpressionAttributeValues: { ':p': { S: 'p' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.Scan',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        ProjectionExpression: '#p',
+                        ExpressionAttributeNames: { '#p': 'partition' },
+                    },
+                },
+            ])
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('reads strongly consistently when the service opts in', async () => {
+        const mock = await createMockDynamo()
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                    AWS_DYNAMODB_READ_CONSISTENCY: 'STRONG',
+                },
+            })
+            await connection.get('Docs', 'p', 'k')
+            await connection.getMany('Docs', [{ partition: 'p', key: 'k' }])
+            await Array.fromAsync(connection.getPartition('Docs', 'p'))
+            await Array.fromAsync(connection.getPartitions('Docs'))
+
+            assert.deepStrictEqual(mock.requests, [
+                {
+                    target: 'DynamoDB_20120810.GetItem',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        ConsistentRead: true,
+                        Key: { partition: { S: 'p' }, key: { S: 'k' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.BatchGetItem',
+                    body: {
+                        RequestItems: {
+                            'Mock.Docs': {
+                                Keys: [{ partition: { S: 'p' }, key: { S: 'k' } }],
+                                ConsistentRead: true,
+                            },
+                        },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.Query',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        ConsistentRead: true,
+                        KeyConditionExpression: '#p = :p',
+                        ExpressionAttributeNames: { '#p': 'partition' },
+                        ExpressionAttributeValues: { ':p': { S: 'p' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.Scan',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        ConsistentRead: true,
+                        ProjectionExpression: '#p',
+                        ExpressionAttributeNames: { '#p': 'partition' },
+                    },
+                },
+            ])
+        } finally {
+            await mock.close()
+        }
+    })
 
     it('reads a whole partition through an empty prefix', async () => {
         const connection = await new Driver().connect(context)
@@ -293,4 +422,59 @@ async function rawItem(partition: string, key: string) {
         ExpressionAttributeNames: { '#d': 'document' },
     })
     return { expiresAt: Item?.expiresAt, document: Item?.document }
+}
+
+// Answers every read with an empty result and records what was asked, so a
+// test can see the request shape; nothing here reaches a real account.
+async function createMockDynamo() {
+    const requests: { target: string | string[] | undefined; body: unknown }[] = []
+    const server = await new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
+        const s = createServer((req, res) => {
+            req.setEncoding('utf-8')
+            let body = ''
+            req.on('data', (chunk: string) => {
+                body += chunk
+            })
+            req.on('end', () => {
+                requests.push({ target: req.headers['x-amz-target'], body: JSON.parse(body) })
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end(JSON.stringify(mockResponse(req.headers['x-amz-target'])))
+            })
+        })
+        s.on('error', reject)
+        s.listen(0, '127.0.0.1', () => {
+            resolve(s)
+        })
+    })
+    const address = server.address()
+    if (address === null || typeof address === 'string') {
+        throw new Error('Mock server did not bind to a TCP port.')
+    }
+    return {
+        baseUrl: `http://127.0.0.1:${address.port.toString()}/`,
+        requests,
+        close: () =>
+            new Promise<void>((resolve, reject) => {
+                server.close(err => {
+                    err ? reject(err) : resolve()
+                })
+            }),
+    }
+}
+
+function mockResponse(target: string | string[] | undefined) {
+    if (target === 'DynamoDB_20120810.GetItem') {
+        return {
+            Item: {
+                partition: { S: 'p' },
+                key: { S: 'k' },
+                revision: { S: 'r' },
+                document: { S: '{}' },
+            },
+        }
+    }
+    if (target === 'DynamoDB_20120810.BatchGetItem') {
+        return { Responses: {} }
+    }
+    return { Items: [] }
 }

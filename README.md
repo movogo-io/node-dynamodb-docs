@@ -11,6 +11,7 @@ The driver reads these from the context's `env`:
 - `TABLE_PREFIX` / `TABLE_POSTFIX`: wrapped around every schema table name, e.g. `staging.Rentals`.
 - `AWS_DYNAMODB_BILLING_METHOD`: `PROVISIONED` with `AWS_DYNAMODB_RCU` / `AWS_DYNAMODB_WCU`, otherwise pay per request.
 - `AWS_DYNAMODB_POINT_IN_TIME_RECOVERY`: `true` enables point-in-time recovery on every table the driver creates. Like time to live, it is only applied on creation; enable it on existing tables once with `aws dynamodb update-continuous-backups --table-name <name> --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`.
+- `AWS_DYNAMODB_READ_CONSISTENCY`: `STRONG` makes every read strongly consistent, at twice the read cost; unset or `EVENTUAL` keeps DynamoDB's default eventually consistent reads. A revision-fenced write is correct either way, since a stale read conflicts and is retried. A service that reads back a row it wrote milliseconds earlier and acts on what it sees, which is what `@movogo-io/sagas`, `@movogo-io/audit`, `@movogo-io/idempotency` and erasure sweeps do, must deploy with `STRONG`, or a stale read shows up as a lost lease, a duplicate audit entry, or an erasure that skipped rows.
 
 Tables are created on first write, so no provisioning step is needed. A table's first write waits for the table to become active, which takes several seconds.
 

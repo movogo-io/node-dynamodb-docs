@@ -5,8 +5,8 @@ import type { KeyRange } from '@movogo-io/docs/schema'
 import { dbRequest } from './aws.js'
 
 export class Driver {
-    connect(context: Context) {
-        return Promise.resolve(new Connection(context))
+    async connect(context: Context) {
+        return new Connection(context, consistentReads(context.env))
     }
 }
 
@@ -31,6 +31,7 @@ type Environment = {
     AWS_DYNAMODB_RCU?: string
     AWS_DYNAMODB_WCU?: string
     AWS_DYNAMODB_POINT_IN_TIME_RECOVERY?: string
+    AWS_DYNAMODB_READ_CONSISTENCY?: string
 }
 
 const throttleAttemptsMax = 8
@@ -49,9 +50,11 @@ type WriteOptions = { now: number; expiresAt?: number }
 
 class Connection {
     readonly #context
+    readonly #consistentRead
 
-    constructor(context: Context) {
+    constructor(context: Context, consistentRead: boolean) {
         this.#context = context
+        this.#consistentRead = consistentRead
     }
 
     async add(
@@ -113,6 +116,7 @@ class Connection {
                 }
             }>('GetItem', {
                 TableName: this.#tableName(table),
+                ...(this.#consistentRead && { ConsistentRead: true }),
                 Key: itemKey(partition, key),
             })
 
@@ -166,6 +170,7 @@ class Connection {
             for (;;) {
                 const result = await this.#request<QueryResponse>('Scan', {
                     TableName: this.#tableName(table),
+                    ...(this.#consistentRead && { ConsistentRead: true }),
                     ProjectionExpression: '#p',
                     ExpressionAttributeNames: {
                         '#p': 'partition',
@@ -212,6 +217,7 @@ class Connection {
             for (;;) {
                 const result = await this.#request<QueryResponse>('Query', {
                     TableName: this.#tableName(table),
+                    ...(this.#consistentRead && { ConsistentRead: true }),
                     ...(lastEvaluatedKey !== undefined && {
                         ExclusiveStartKey: lastEvaluatedKey,
                     }),
@@ -352,7 +358,12 @@ class Connection {
         for (let attempt = 1; ; attempt++) {
             try {
                 const result = await this.#request<BatchGetResponse>('BatchGetItem', {
-                    RequestItems: { [tableName]: { Keys: keys } },
+                    RequestItems: {
+                        [tableName]: {
+                            Keys: keys,
+                            ...(this.#consistentRead && { ConsistentRead: true }),
+                        },
+                    },
                 })
                 rows.push(...(result.Responses?.[tableName] ?? []).map(item => rowOf(item)))
                 const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys ?? []
@@ -721,6 +732,24 @@ function liveRevisionCondition(revision: unknown, nowSeconds: number) {
             ':nowSeconds': { N: nowSeconds.toString() },
         },
     }
+}
+
+// Reads are eventually consistent unless the service opts in: a strongly
+// consistent read costs twice the read units, and only a service that reads
+// back a row it wrote milliseconds earlier and decides on what it sees
+// needs it. A revision-fenced write stays correct either way; a stale read
+// just conflicts and retries.
+function consistentReads(env: Environment | undefined) {
+    const consistency = env?.AWS_DYNAMODB_READ_CONSISTENCY ?? 'EVENTUAL'
+    if (consistency === 'STRONG') {
+        return true
+    }
+    if (consistency === 'EVENTUAL') {
+        return false
+    }
+    throw new Error(
+        `AWS_DYNAMODB_READ_CONSISTENCY must be STRONG or EVENTUAL, not '${consistency}'.`,
+    )
 }
 
 function itemKey(partition: string, key: string) {
