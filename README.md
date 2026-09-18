@@ -14,6 +14,10 @@ The driver reads these from the context's `env`:
 
 Tables are created on first write, so no provisioning step is needed. A table's first write waits for the table to become active, which takes several seconds.
 
+## Batch reads
+
+`findEach` in `@movogo-io/docs` hands the driver a whole list of keys, which it reads through `BatchGetItem`: at most 100 keys per request, at most four requests in flight. DynamoDB answers a request it could not finish — a throttle, or 16MB of items — with a 200 and the keys it skipped, so the driver resubmits those with the same backoff it uses for throttled requests, and throws once the attempts are spent. It never answers with part of a list: the store cannot tell a short answer from documents that have been deleted, and would report the difference as missing.
+
 ## Expiry
 
 Document expiry is declared in the service through `schema.expiry(...)` from `@movogo-io/docs`; see that package's instructions. The driver stores the expiry it is handed as a numeric `expiresAt` item attribute in epoch seconds, removes the attribute when a write carries no expiry, and enables DynamoDB time to live on that attribute for every table it creates, so expired items are eventually deleted without a sweeper. Expired items that DynamoDB has not yet removed are hidden by `@movogo-io/docs`, not by the driver.

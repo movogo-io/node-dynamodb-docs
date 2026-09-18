@@ -34,6 +34,12 @@ type Environment = {
 }
 
 const throttleAttemptsMax = 8
+// BatchGetItem reads at most 100 keys, and answers at most 16MB; whatever it
+// could not read comes back as unprocessed keys with a 200, not as an error.
+const batchGetKeysMax = 100
+// Four requests in flight reads 400 keys at once, a burst of connections no
+// larger than the one the store opens reading a list through `get`.
+const batchGetRequestsInFlightMax = 4
 const backoffDelayMsBase = 100
 const backoffDelayMsMax = 3200
 const tableCreationAttemptsMax = 60
@@ -132,6 +138,26 @@ class Connection {
         }
     }
 
+    // Every row among `refs` that exists, or a throw. A batch that comes back
+    // with unprocessed keys is retried until it is whole, because the store
+    // cannot tell a short answer from documents that are gone.
+    async getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+        const batches = []
+        for (let start = 0; start < refs.length; start += batchGetKeysMax) {
+            batches.push(refs.slice(start, start + batchGetKeysMax))
+        }
+        const rows = []
+        for (let start = 0; start < batches.length; start += batchGetRequestsInFlightMax) {
+            const read = await Promise.all(
+                batches
+                    .slice(start, start + batchGetRequestsInFlightMax)
+                    .map(batch => this.#batchGet(table, batch)),
+            )
+            rows.push(...read.flat())
+        }
+        return rows
+    }
+
     async *getPartitions(table: string) {
         try {
             let lastEvaluatedKey: unknown
@@ -199,13 +225,7 @@ class Connection {
                             return undefined
                         }
 
-                        return {
-                            partition: item.partition?.S ?? '',
-                            key,
-                            revision: item.revision?.S as unknown,
-                            document: JSON.parse(item.document?.S ?? '{}') as unknown,
-                            ...expiresAtOf(item),
-                        }
+                        return rowOf(item)
                     }).filter(i => !!i)
                 }
 
@@ -321,6 +341,42 @@ class Connection {
 
     close() {
         return Promise.resolve()
+    }
+
+    async #batchGet(table: string, refs: readonly { partition: string; key: string }[]) {
+        const tableName = this.#tableName(table)
+        const rows = []
+        let keys: { [key: string]: AttributeValue }[] = refs.map(ref =>
+            itemKey(ref.partition, ref.key),
+        )
+        for (let attempt = 1; ; attempt++) {
+            try {
+                const result = await this.#request<BatchGetResponse>('BatchGetItem', {
+                    RequestItems: { [tableName]: { Keys: keys } },
+                })
+                rows.push(...(result.Responses?.[tableName] ?? []).map(item => rowOf(item)))
+                const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys ?? []
+                if (unprocessed.length === 0) {
+                    return rows
+                }
+                if (throttleAttemptsMax <= attempt) {
+                    throw new Error(
+                        `Reading ${unprocessed.length.toString()} of ${refs.length.toString()} keys of table ${tableName} kept being throttled.`,
+                    )
+                }
+                await backoff(attempt)
+                keys = unprocessed
+            } catch (e) {
+                // A table that does not exist yet holds none of the documents.
+                if (isErrorType(e, 'ResourceNotFoundException')) {
+                    return []
+                }
+                if (isErrorType(e, 'ResourceInUseException')) {
+                    return []
+                }
+                throw e
+            }
+        }
     }
 
     async #recoverTransaction(e: unknown, items: TransactionItem[], attempt: number) {
@@ -523,6 +579,21 @@ class Connection {
     }
 }
 
+type BatchGetResponse = {
+    Responses?: {
+        [table: string]: {
+            [key: string]: AttributeValue
+        }[]
+    }
+    UnprocessedKeys?: {
+        [table: string]: {
+            Keys?: {
+                [key: string]: AttributeValue
+            }[]
+        }
+    }
+}
+
 type QueryResponse = {
     Items?: {
         [key: string]: AttributeValue
@@ -567,6 +638,16 @@ function putItem(
             document: { S: JSON.stringify(document) },
             ...(expiresAt !== undefined && { expiresAt: { N: expiresAt.toString() } }),
         },
+    }
+}
+
+function rowOf(item: { [key: string]: AttributeValue }) {
+    return {
+        partition: item.partition?.S ?? '',
+        key: item.key?.S ?? '',
+        revision: item.revision?.S as unknown,
+        document: JSON.parse(item.document?.S ?? '{}') as unknown,
+        ...expiresAtOf(item),
     }
 }
 

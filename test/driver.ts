@@ -50,6 +50,64 @@ describe('driver', () => {
         )
     }).timeout(30_000)
 
+    // The conformance harness covers what `getMany` answers; what is DynamoDB's
+    // alone is the 100-key limit of BatchGetItem, which a list longer than that
+    // must be split across, and the expiry riding along on each item.
+    it('reads more keys than one batch holds, across partitions', async () => {
+        const connection = await new Driver().connect(context)
+        const partitions = [randomUUID(), randomUUID()]
+        const refs = Array.from({ length: 101 }, (_, i) => ({
+            partition: partitions[i % 2] ?? '',
+            key: `k${i.toString().padStart(3, '0')}`,
+        }))
+        await Promise.all(
+            refs.map(ref =>
+                connection.add('DocsTests', ref.partition, ref.key, { n: ref.key }, { now }),
+            ),
+        )
+
+        const found = await connection.getMany('DocsTests', [
+            ...refs,
+            { partition: partitions[0] ?? '', key: 'absent' },
+        ])
+        assert.deepStrictEqual(
+            found.map(row => row.key).sort((a, b) => a.localeCompare(b)),
+            refs.map(ref => ref.key).sort((a, b) => a.localeCompare(b)),
+        )
+        assert.deepStrictEqual(
+            found.map(row => JSON.stringify(row.document)).sort((a, b) => a.localeCompare(b)),
+            refs.map(ref => JSON.stringify({ n: ref.key })).sort((a, b) => a.localeCompare(b)),
+        )
+    }).timeout(120_000)
+
+    it('reads the expiry of a batch, and nothing of a table never written to', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        await connection.add('TtlTestDocs', partition, 'a', { n: 1 }, { now, expiresAt: now + 60 })
+        await connection.add('TtlTestDocs', partition, 'b', { n: 2 }, { now })
+
+        assert.deepStrictEqual(
+            (
+                await connection.getMany('TtlTestDocs', [
+                    { partition, key: 'a' },
+                    { partition, key: 'b' },
+                ])
+            )
+                .map(row => [row.key, row.expiresAt])
+                .sort(([a], [b]) => String(a).localeCompare(String(b))),
+            [
+                ['a', now + 60],
+                ['b', undefined],
+            ],
+        )
+        assert.deepStrictEqual(
+            await connection.getMany(`Absent${randomUUID().replaceAll('-', '')}`, [
+                { partition, key: 'a' },
+            ]),
+            [],
+        )
+    }).timeout(60_000)
+
     it('stores the expiry as a numeric top-level attribute', async () => {
         const connection = await new Driver().connect(context)
         const partition = randomUUID()
