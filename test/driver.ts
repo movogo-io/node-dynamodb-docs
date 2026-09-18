@@ -36,6 +36,20 @@ describe('driver', () => {
         () => context,
     )
 
+    it('reads a whole partition through an empty prefix', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        await connection.add('DocsTests', partition, 'a', { n: 1 }, { now })
+        await connection.add('DocsTests', partition, 'b', { n: 2 }, { now })
+        assert.deepStrictEqual(
+            await Array.fromAsync(
+                connection.getPartition('DocsTests', partition, { withPrefix: '' }),
+                r => r.key,
+            ),
+            ['a', 'b'],
+        )
+    }).timeout(30_000)
+
     it('stores the expiry as a numeric top-level attribute', async () => {
         const connection = await new Driver().connect(context)
         const partition = randomUUID()

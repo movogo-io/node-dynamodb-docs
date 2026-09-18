@@ -89,6 +89,11 @@ class Connection {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
             }
+            // A transaction holds the item; the revision this write assumes, or the
+            // absence it asserts, is about to be stale.
+            if (isErrorType(e, 'TransactionConflictException')) {
+                throw conflict()
+            }
             throw e
         }
         return revision
@@ -247,6 +252,9 @@ class Connection {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
             }
+            if (isErrorType(e, 'TransactionConflictException')) {
+                throw conflict()
+            }
             if (isErrorType(e, 'ResourceInUseException')) {
                 this.#context.log?.debug(
                     'Table in use; retrying assuming it is being created.',
@@ -280,6 +288,9 @@ class Connection {
             })
         } catch (e) {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
+                throw conflict()
+            }
+            if (isErrorType(e, 'TransactionConflictException')) {
                 throw conflict()
             }
             if (isErrorType(e, 'ResourceInUseException')) {
@@ -651,6 +662,10 @@ function queryFromRange(partition: string, range?: KeyRange) {
         }
     }
     if ('withPrefix' in range) {
+        // Every key begins with '', and DynamoDB rejects an empty key condition value.
+        if (range.withPrefix === '') {
+            return queryFromRange(partition)
+        }
         return {
             KeyConditionExpression: '#p = :p AND begins_with(#k, :withPrefix)',
             ExpressionAttributeNames: {
