@@ -11,7 +11,7 @@ The driver reads these from the context's `env`:
 - `TABLE_PREFIX` / `TABLE_POSTFIX`: wrapped around every schema table name, e.g. `staging.Rentals`.
 - `AWS_DYNAMODB_BILLING_METHOD`: `PROVISIONED` with `AWS_DYNAMODB_RCU` / `AWS_DYNAMODB_WCU`, otherwise pay per request.
 - `AWS_DYNAMODB_POINT_IN_TIME_RECOVERY`: `true` enables point-in-time recovery on every table the driver creates. Like time to live, it is only applied on creation; enable it on existing tables once with `aws dynamodb update-continuous-backups --table-name <name> --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true`.
-- `AWS_DYNAMODB_READ_CONSISTENCY`: `STRONG` makes every read strongly consistent, at twice the read cost; unset or `EVENTUAL` keeps DynamoDB's default eventually consistent reads. A revision-fenced write is correct either way, since a stale read conflicts and is retried. A service that reads back a row it wrote milliseconds earlier and acts on what it sees, which is what `@movogo-io/sagas`, `@movogo-io/audit`, `@movogo-io/idempotency` and erasure sweeps do, must deploy with `STRONG`, or a stale read shows up as a lost lease, a duplicate audit entry, or an erasure that skipped rows.
+- `AWS_DYNAMODB_READ_CONSISTENCY`: `STRONG` makes every read strongly consistent, at twice the read cost; unset or `EVENTUAL` keeps DynamoDB's default eventually consistent reads. A revision-fenced write is correct either way, since a stale read conflicts and is retried. A read that looks at a row written milliseconds earlier and acts on what it sees asks for its own consistency: every read of `@movogo-io/docs` 0.2.0 takes a trailing `{ consistent: true }`, which this driver sends as `ConsistentRead` for that call whatever the env var says. `@movogo-io/sagas` 0.3.0, `@movogo-io/idempotency` and `@movogo-io/audit` built against docs 0.2.0 ask for it on the reads that need it (lease claims, fencing checks, `revisions` and erasures right after a write), so the env var is no longer required for them; it remains the override for a service that wants every read strong.
 
 Tables are created on first write, so no provisioning step is needed. A table's first write waits for the table to become active, which takes several seconds.
 
@@ -28,6 +28,10 @@ Tables created before version 0.2.0 need time to live enabled once:
 ```sh
 aws dynamodb update-time-to-live --table-name <TABLE_PREFIX>Rentals<TABLE_POSTFIX> --time-to-live-specification Enabled=true,AttributeName=expiresAt
 ```
+
+## Sequence and timestamps
+
+Every row `@movogo-io/docs` 0.2.0 answers carries `seq` and `updatedAt`, read back from the `seq`, `updated` and `created` item attributes this driver has always written. `seq` is a per-item write counter: the first `add` of a key starts it at 0, and every later write adds one to it, `add` and a transaction's `put` included, over a live item or an expired one DynamoDB has not yet swept. A delete, and a transaction's `delete` or `clear`, removes the item outright, so a document re-added under the key starts at 0 again, and a `clear` of a key never written creates nothing. `add` and `update` answer the revision, `seq` and `updatedAt` they stored, read from the item DynamoDB answers the write with; a transaction answers nothing, so `@movogo-io/docs` reports what the driver stores for a write over the row it read beforehand. `created` and `updated` are stamped from the context clock the store hands down, at second precision, never from the wall clock; the in-memory driver stamps the same instant, so a test that fixes `context.now` sees one `updatedAt` from both. A conditional write that fails changes none of them.
 
 ## Tests
 

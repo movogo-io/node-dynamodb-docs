@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
-import type { TransactionItem } from '@movogo-io/docs/driver'
+import type { ReadOptions, TransactionItem, Written } from '@movogo-io/docs/driver'
 import type { KeyRange } from '@movogo-io/docs/schema'
 import { dbRequest } from './aws.js'
 
 export class Driver {
-    async connect(context: Context) {
-        return new Connection(context, consistentReads(context.env))
+    connect(context: Context) {
+        return Promise.try(() => new Connection(context, consistentReads(context.env)))
     }
 }
 
@@ -63,21 +63,22 @@ class Connection {
         key: string,
         document: unknown,
         options: WriteOptions,
-    ): Promise<unknown> {
-        const revision = randomUUID().replaceAll('-', '')
+    ): Promise<Written> {
         try {
-            await this.#request('PutItem', {
-                ...putItem(
+            const { Attributes } = await this.#request<UpdateResponse>('UpdateItem', {
+                ...addItem(
                     this.#tableName(table),
                     partition,
                     key,
-                    revision,
+                    randomUUID().replaceAll('-', ''),
                     document,
                     options.expiresAt,
-                    new Date().toISOString(),
+                    isoOf(options.now),
+                    options.now,
                 ),
-                ...absentOrExpiredCondition(options.now),
+                ReturnValues: 'ALL_NEW',
             })
+            return writtenOf(Attributes)
         } catch (e) {
             if (isErrorType(e, 'ResourceNotFoundException')) {
                 await this.#createTable(table)
@@ -105,10 +106,9 @@ class Connection {
             }
             throw e
         }
-        return revision
     }
 
-    async get(table: string, partition: string, key: string) {
+    async get(table: string, partition: string, key: string, options?: ReadOptions) {
         try {
             const result = await this.#request<{
                 Item?: {
@@ -116,7 +116,7 @@ class Connection {
                 }
             }>('GetItem', {
                 TableName: this.#tableName(table),
-                ...(this.#consistentRead && { ConsistentRead: true }),
+                ...(this.#consistent(options) && { ConsistentRead: true }),
                 Key: itemKey(partition, key),
             })
 
@@ -124,13 +124,7 @@ class Connection {
                 throw notFound()
             }
 
-            return {
-                partition,
-                key,
-                revision: result.Item.revision?.S as unknown,
-                document: JSON.parse(result.Item.document?.S ?? '{}') as unknown,
-                ...expiresAtOf(result.Item),
-            }
+            return rowOf(result.Item)
         } catch (e) {
             if (isErrorType(e, 'ResourceNotFoundException')) {
                 throw notFound()
@@ -145,7 +139,11 @@ class Connection {
     // Every row among `refs` that exists, or a throw. A batch that comes back
     // with unprocessed keys is retried until it is whole, because the store
     // cannot tell a short answer from documents that are gone.
-    async getMany(table: string, refs: readonly { partition: string; key: string }[]) {
+    async getMany(
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+        options?: ReadOptions,
+    ) {
         const batches = []
         for (let start = 0; start < refs.length; start += batchGetKeysMax) {
             batches.push(refs.slice(start, start + batchGetKeysMax))
@@ -155,7 +153,7 @@ class Connection {
             const read = await Promise.all(
                 batches
                     .slice(start, start + batchGetRequestsInFlightMax)
-                    .map(batch => this.#batchGet(table, batch)),
+                    .map(batch => this.#batchGet(table, batch, options)),
             )
             rows.push(...read.flat())
         }
@@ -207,7 +205,7 @@ class Connection {
         }
     }
 
-    async *getPartition(table: string, partition: string, range?: KeyRange) {
+    async *getPartition(table: string, partition: string, range?: KeyRange, options?: ReadOptions) {
         if (range && 'before' in range && range.before === '') {
             return
         }
@@ -217,7 +215,7 @@ class Connection {
             for (;;) {
                 const result = await this.#request<QueryResponse>('Query', {
                     TableName: this.#tableName(table),
-                    ...(this.#consistentRead && { ConsistentRead: true }),
+                    ...(this.#consistent(options) && { ConsistentRead: true }),
                     ...(lastEvaluatedKey !== undefined && {
                         ExclusiveStartKey: lastEvaluatedKey,
                     }),
@@ -231,7 +229,9 @@ class Connection {
                             return undefined
                         }
 
-                        return rowOf(item)
+                        // A partition's rows carry no partition: the caller named it.
+                        const { partition: _, ...row } = rowOf(item)
+                        return row
                     }).filter(i => !!i)
                 }
 
@@ -258,22 +258,22 @@ class Connection {
         currentRevision: unknown,
         document: unknown,
         options: WriteOptions,
-    ): Promise<unknown> {
-        const newRevision = randomUUID().replaceAll('-', '')
+    ): Promise<Written> {
         try {
-            await this.#request(
-                'UpdateItem',
-                updateItem(
+            const { Attributes } = await this.#request<UpdateResponse>('UpdateItem', {
+                ...updateItem(
                     this.#tableName(table),
                     partition,
                     key,
                     currentRevision,
-                    newRevision,
+                    randomUUID().replaceAll('-', ''),
                     document,
                     options,
-                    new Date().toISOString(),
+                    isoOf(options.now),
                 ),
-            )
+                ReturnValues: 'ALL_NEW',
+            })
+            return writtenOf(Attributes)
         } catch (e) {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
@@ -297,7 +297,6 @@ class Connection {
             }
             throw e
         }
-        return newRevision
     }
 
     async delete(
@@ -330,7 +329,7 @@ class Connection {
     }
 
     async transact(items: TransactionItem[], options: { now: number }) {
-        const timestamp = new Date().toISOString()
+        const timestamp = isoOf(options.now)
         const request = {
             TransactItems: items.map(item => this.#transactItem(item, options.now, timestamp)),
             ClientRequestToken: randomUUID(),
@@ -349,7 +348,16 @@ class Connection {
         return Promise.resolve()
     }
 
-    async #batchGet(table: string, refs: readonly { partition: string; key: string }[]) {
+    // The service-wide setting, or the caller asking for this one read.
+    #consistent(options: ReadOptions | undefined) {
+        return this.#consistentRead || options?.consistent === true
+    }
+
+    async #batchGet(
+        table: string,
+        refs: readonly { partition: string; key: string }[],
+        options?: ReadOptions,
+    ) {
         const tableName = this.#tableName(table)
         const rows = []
         let keys: { [key: string]: AttributeValue }[] = refs.map(ref =>
@@ -361,7 +369,7 @@ class Connection {
                     RequestItems: {
                         [tableName]: {
                             Keys: keys,
-                            ...(this.#consistentRead && { ConsistentRead: true }),
+                            ...(this.#consistent(options) && { ConsistentRead: true }),
                         },
                     },
                 })
@@ -432,22 +440,7 @@ class Connection {
         switch (item.op) {
             case 'add':
                 return {
-                    Put: {
-                        ...putItem(
-                            tableName,
-                            item.partition,
-                            item.key,
-                            item.newRevision,
-                            item.document,
-                            item.expiresAt,
-                            timestamp,
-                        ),
-                        ...absentOrExpiredCondition(nowSeconds),
-                    },
-                }
-            case 'put':
-                return {
-                    Put: putItem(
+                    Update: addItem(
                         tableName,
                         item.partition,
                         item.key,
@@ -455,6 +448,20 @@ class Connection {
                         item.document,
                         item.expiresAt,
                         timestamp,
+                        nowSeconds,
+                    ),
+                }
+            case 'put':
+                return {
+                    Update: putUpdateItem(
+                        tableName,
+                        item.partition,
+                        item.key,
+                        item.newRevision,
+                        item.document,
+                        item.expiresAt,
+                        timestamp,
+                        true,
                     ),
                 }
             case 'update':
@@ -605,6 +612,12 @@ type BatchGetResponse = {
     }
 }
 
+type UpdateResponse = {
+    Attributes?: {
+        [key: string]: AttributeValue
+    }
+}
+
 type QueryResponse = {
     Items?: {
         [key: string]: AttributeValue
@@ -629,27 +642,40 @@ type AttributeValue = {
     BOOL?: boolean
 }
 
-function putItem(
+// An `add` is an Update, not a Put: a Put would write `seq` afresh, where an
+// add over an expired item continues its count.
+function addItem(
     tableName: string,
     partition: string,
     key: string,
-    revision: unknown,
+    newRevision: unknown,
     document: unknown,
     expiresAt: number | undefined,
     timestamp: string,
+    nowSeconds: number,
 ) {
-    return {
-        TableName: tableName,
-        Item: {
-            ...itemKey(partition, key),
-            revision: { S: revision as string },
-            created: { S: timestamp },
-            updated: { S: timestamp },
-            seq: { N: '0' },
-            document: { S: JSON.stringify(document) },
-            ...(expiresAt !== undefined && { expiresAt: { N: expiresAt.toString() } }),
-        },
+    return withCondition(
+        putUpdateItem(
+            tableName,
+            partition,
+            key,
+            newRevision,
+            document,
+            expiresAt,
+            timestamp,
+            false,
+        ),
+        absentOrExpiredCondition(nowSeconds),
+    )
+}
+
+// What a write stored, from the attributes DynamoDB answers a write with.
+function writtenOf(attributes: { [key: string]: AttributeValue } | undefined): Written {
+    if (attributes === undefined) {
+        throw new Error('UpdateItem answered without the attributes of the item it wrote.')
     }
+    const { revision, seq, updatedAt } = rowOf(attributes)
+    return { revision, seq, updatedAt }
 }
 
 function rowOf(item: { [key: string]: AttributeValue }) {
@@ -658,6 +684,10 @@ function rowOf(item: { [key: string]: AttributeValue }) {
         key: item.key?.S ?? '',
         revision: item.revision?.S as unknown,
         document: JSON.parse(item.document?.S ?? '{}') as unknown,
+        // Every item this driver and @riddance/dynamodb-docs ever wrote carries
+        // both; the fallbacks exist for hand-built items (test mocks) only.
+        seq: Number(item.seq?.N ?? '0'),
+        updatedAt: item.updated?.S ?? item.created?.S ?? '1970-01-01T00:00:00.000Z',
         ...expiresAtOf(item),
     }
 }
@@ -707,10 +737,62 @@ function updateExpression(expiresAt: number | undefined) {
     return `${set}, expiresAt = :expiresAt`
 }
 
+// A transaction's unconditional put. A Put item would write `seq` afresh, so
+// it is an Update instead: `seq` continues from the item it replaces, live or
+// expired, and a new item starts at 0. A plain ADD would start it at 1.
+// `created` is kept for a put over an item, and stamped anew for an add, which
+// begins the document anew.
+function putUpdateItem(
+    tableName: string,
+    partition: string,
+    key: string,
+    newRevision: unknown,
+    document: unknown,
+    expiresAt: number | undefined,
+    timestamp: string,
+    keepCreated: boolean,
+) {
+    const created = keepCreated ? 'if_not_exists(created, :updated)' : ':updated'
+    const set = `SET seq = if_not_exists(seq, :minusOne) + :one, revision = :newRevision, updated = :updated, created = ${created}, document = :document`
+    return {
+        TableName: tableName,
+        Key: itemKey(partition, key),
+        UpdateExpression:
+            expiresAt === undefined ? `${set} REMOVE expiresAt` : `${set}, expiresAt = :expiresAt`,
+        ExpressionAttributeValues: {
+            ':minusOne': { N: '-1' },
+            ':one': { N: '1' },
+            ':newRevision': { S: newRevision as string },
+            ':updated': { S: timestamp },
+            ':document': { S: JSON.stringify(document) },
+            ...(expiresAt !== undefined && { ':expiresAt': { N: expiresAt.toString() } }),
+        },
+    }
+}
+
+// A delete removes the item, `seq` included: a document re-added under the
+// key starts its count at 0, and a key never written stays absent.
 function deleteItem(tableName: string, partition: string, key: string) {
     return {
         TableName: tableName,
         Key: itemKey(partition, key),
+    }
+}
+
+function withCondition<T extends { ExpressionAttributeValues: { [name: string]: AttributeValue } }>(
+    item: T,
+    condition: {
+        ConditionExpression: string
+        ExpressionAttributeValues: { [name: string]: AttributeValue }
+    },
+) {
+    return {
+        ...item,
+        ConditionExpression: condition.ConditionExpression,
+        ExpressionAttributeValues: {
+            ...item.ExpressionAttributeValues,
+            ...condition.ExpressionAttributeValues,
+        },
     }
 }
 
@@ -734,11 +816,12 @@ function liveRevisionCondition(revision: unknown, nowSeconds: number) {
     }
 }
 
-// Reads are eventually consistent unless the service opts in: a strongly
-// consistent read costs twice the read units, and only a service that reads
-// back a row it wrote milliseconds earlier and decides on what it sees
-// needs it. A revision-fenced write stays correct either way; a stale read
-// just conflicts and retries.
+// Reads are eventually consistent unless the service opts in for all of them:
+// a strongly consistent read costs twice the read units, and only a read that
+// looks at a row written milliseconds earlier and decides on what it sees
+// needs it. The env var is the service-wide override; a caller that needs one
+// such read asks per call with `{ consistent: true }`. A revision-fenced write
+// stays correct either way; a stale read just conflicts and retries.
 function consistentReads(env: Environment | undefined) {
     const consistency = env?.AWS_DYNAMODB_READ_CONSISTENCY ?? 'EVENTUAL'
     if (consistency === 'STRONG') {
@@ -750,6 +833,13 @@ function consistentReads(env: Environment | undefined) {
     throw new Error(
         `AWS_DYNAMODB_READ_CONSISTENCY must be STRONG or EVENTUAL, not '${consistency}'.`,
     )
+}
+
+// `created` and `updated` come from the context clock the store hands down as
+// `options.now`, at second precision, never from the wall clock: the memory
+// driver stamps the same instant, so a test sees one value from both.
+function isoOf(seconds: number) {
+    return new Date(seconds * 1000).toISOString()
 }
 
 function itemKey(partition: string, key: string) {

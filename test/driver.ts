@@ -15,6 +15,9 @@ const context: { env: LocalEnv & { TABLE_PREFIX: string }; on?: undefined } = {
 }
 
 const now = 4_000_000_000
+// What a write at `now`, and one at `now + 60`, stamps as `created`/`updated`.
+const updated = { S: '2096-10-02T07:06:40.000Z' }
+const updatedLater = { S: '2096-10-02T07:07:40.000Z' }
 
 type Schema = {
     IndexTestDocs: { [partition: string]: { [key: string]: { unitId: string } } }
@@ -94,6 +97,101 @@ describe('driver', () => {
                         TableName: 'Mock.Docs',
                         ProjectionExpression: '#p',
                         ExpressionAttributeNames: { '#p': 'partition' },
+                    },
+                },
+            ])
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('reads seq 0 and the epoch from an item written without them', async () => {
+        const mock = await createMockDynamo()
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+            assert.deepStrictEqual(await connection.get('Docs', 'p', 'k'), {
+                partition: 'p',
+                key: 'k',
+                revision: 'r',
+                document: {},
+                seq: 0,
+                updatedAt: '1970-01-01T00:00:00.000Z',
+            })
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('reads strongly consistently when the caller asks for that one read', async () => {
+        const mock = await createMockDynamo()
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+            await connection.get('Docs', 'p', 'k', { consistent: true })
+            await connection.getMany('Docs', [{ partition: 'p', key: 'k' }], { consistent: true })
+            await Array.fromAsync(
+                connection.getPartition('Docs', 'p', undefined, { consistent: true }),
+            )
+            await connection.get('Docs', 'p', 'k', { consistent: false })
+            await connection.get('Docs', 'p', 'k')
+
+            assert.deepStrictEqual(mock.requests, [
+                {
+                    target: 'DynamoDB_20120810.GetItem',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        ConsistentRead: true,
+                        Key: { partition: { S: 'p' }, key: { S: 'k' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.BatchGetItem',
+                    body: {
+                        RequestItems: {
+                            'Mock.Docs': {
+                                Keys: [{ partition: { S: 'p' }, key: { S: 'k' } }],
+                                ConsistentRead: true,
+                            },
+                        },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.Query',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        ConsistentRead: true,
+                        KeyConditionExpression: '#p = :p',
+                        ExpressionAttributeNames: { '#p': 'partition' },
+                        ExpressionAttributeValues: { ':p': { S: 'p' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.GetItem',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        Key: { partition: { S: 'p' }, key: { S: 'k' } },
+                    },
+                },
+                {
+                    target: 'DynamoDB_20120810.GetItem',
+                    body: {
+                        TableName: 'Mock.Docs',
+                        Key: { partition: { S: 'p' }, key: { S: 'k' } },
                     },
                 },
             ])
@@ -241,7 +339,7 @@ describe('driver', () => {
         const connection = await new Driver().connect(context)
         const partition = randomUUID()
         const key = randomUUID()
-        const revision = await connection.add(
+        const { revision } = await connection.add(
             'TtlTestDocs',
             partition,
             key,
@@ -252,9 +350,12 @@ describe('driver', () => {
         assert.deepStrictEqual(await rawItem(partition, key), {
             expiresAt: { N: '4000000060' },
             document: { S: '{"data":"x"}' },
+            seq: { N: '0' },
+            created: updated,
+            updated,
         })
 
-        const updatedRevision = await connection.update(
+        const { revision: updatedRevision } = await connection.update(
             'TtlTestDocs',
             partition,
             key,
@@ -265,6 +366,9 @@ describe('driver', () => {
         assert.deepStrictEqual(await rawItem(partition, key), {
             expiresAt: { N: '4000000120' },
             document: { S: '{"data":"y"}' },
+            seq: { N: '1' },
+            created: updated,
+            updated,
         })
 
         await connection.update(
@@ -273,11 +377,184 @@ describe('driver', () => {
             key,
             updatedRevision,
             { data: 'z' },
-            { now },
+            { now: now + 60 },
         )
         assert.deepStrictEqual(await rawItem(partition, key), {
             expiresAt: undefined,
             document: { S: '{"data":"z"}' },
+            seq: { N: '2' },
+            created: updated,
+            updated: updatedLater,
+        })
+    }).timeout(60_000)
+
+    it('answers a write with what it stored', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        const key = randomUUID()
+        const added = await connection.add('TtlTestDocs', partition, key, { n: 1 }, { now })
+        assert.deepStrictEqual(added, {
+            revision: added.revision,
+            seq: 0,
+            updatedAt: updated.S,
+        })
+        const updatedRow = await connection.update(
+            'TtlTestDocs',
+            partition,
+            key,
+            added.revision,
+            { n: 2 },
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(updatedRow, {
+            revision: updatedRow.revision,
+            seq: 1,
+            updatedAt: updatedLater.S,
+        })
+        assert.notStrictEqual(updatedRow.revision, added.revision)
+        assert.deepStrictEqual(await rawItem(partition, key), {
+            expiresAt: undefined,
+            document: { S: '{"n":2}' },
+            seq: { N: '1' },
+            created: updated,
+            updated: updatedLater,
+        })
+    }).timeout(60_000)
+
+    it('removes a deleted item outright, and re-adds its key from seq 0', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        const key = randomUUID()
+        const added = await connection.add('TtlTestDocs', partition, key, { n: 1 }, { now })
+        const { revision } = await connection.update(
+            'TtlTestDocs',
+            partition,
+            key,
+            added.revision,
+            { n: 2 },
+            { now },
+        )
+        await connection.delete('TtlTestDocs', partition, key, revision, { now })
+
+        assert.deepStrictEqual(await rawItem(partition, key), undefined)
+        assert.deepStrictEqual(await rawPartition(partition), [])
+        await assert.rejects(connection.get('TtlTestDocs', partition, key), { statusCode: 404 })
+        assert.deepStrictEqual(
+            await Array.fromAsync(connection.getPartition('TtlTestDocs', partition)),
+            [],
+        )
+        assert.deepStrictEqual(await connection.getMany('TtlTestDocs', [{ partition, key }]), [])
+
+        const reAdded = await connection.add(
+            'TtlTestDocs',
+            partition,
+            key,
+            { n: 3 },
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(reAdded, {
+            revision: reAdded.revision,
+            seq: 0,
+            updatedAt: updatedLater.S,
+        })
+        assert.deepStrictEqual(await rawItem(partition, key), {
+            expiresAt: undefined,
+            document: { S: '{"n":3}' },
+            seq: { N: '0' },
+            created: updatedLater,
+            updated: updatedLater,
+        })
+    }).timeout(60_000)
+
+    it('removes transacted deletes and clears outright, creating nothing for a clear', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        const key = randomUUID()
+        const clearedKey = randomUUID()
+        const unwrittenKey = randomUUID()
+        const { revision } = await connection.add('TtlTestDocs', partition, key, { n: 1 }, { now })
+        await connection.add('TtlTestDocs', partition, clearedKey, { n: 1 }, { now })
+        await connection.transact(
+            [
+                { op: 'delete', table: 'TtlTestDocs', partition, key, revision },
+                { op: 'clear', table: 'TtlTestDocs', partition, key: clearedKey },
+                { op: 'clear', table: 'TtlTestDocs', partition, key: unwrittenKey },
+            ],
+            { now },
+        )
+
+        assert.deepStrictEqual(await rawItem(partition, key), undefined)
+        assert.deepStrictEqual(await rawItem(partition, clearedKey), undefined)
+        assert.deepStrictEqual(await rawItem(partition, unwrittenKey), undefined)
+        assert.deepStrictEqual(await rawPartition(partition), [])
+    }).timeout(60_000)
+
+    it('continues seq over an expired item', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        const key = randomUUID()
+        const added = await connection.add(
+            'TtlTestDocs',
+            partition,
+            key,
+            { n: 1 },
+            { now, expiresAt: now + 60 },
+        )
+        await connection.update(
+            'TtlTestDocs',
+            partition,
+            key,
+            added.revision,
+            { n: 2 },
+            { now, expiresAt: now + 60 },
+        )
+        const reAdded = await connection.add(
+            'TtlTestDocs',
+            partition,
+            key,
+            { n: 3 },
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(reAdded, {
+            revision: reAdded.revision,
+            seq: 2,
+            updatedAt: updatedLater.S,
+        })
+        assert.deepStrictEqual(await rawItem(partition, key), {
+            expiresAt: undefined,
+            document: { S: '{"n":3}' },
+            seq: { N: '2' },
+            created: updatedLater,
+            updated: updatedLater,
+        })
+    }).timeout(60_000)
+
+    it('continues seq through updates and a transacted put', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+        const key = randomUUID()
+        const added = await connection.add('TtlTestDocs', partition, key, { n: 1 }, { now })
+        await connection.update('TtlTestDocs', partition, key, added.revision, { n: 2 }, { now })
+        assert.deepStrictEqual((await rawItem(partition, key))?.seq, { N: '1' })
+        await connection.transact(
+            [
+                {
+                    op: 'put',
+                    table: 'TtlTestDocs',
+                    partition,
+                    key,
+                    document: { n: 3 },
+                    newRevision: randomUUID(),
+                },
+            ],
+            { now: now + 60 },
+        )
+        assert.deepStrictEqual(await rawItem(partition, key), {
+            expiresAt: undefined,
+            document: { S: '{"n":3}' },
+            seq: { N: '2' },
+            created: updated,
+            updated: updatedLater,
         })
     }).timeout(60_000)
 
@@ -303,6 +580,31 @@ describe('driver', () => {
         assert.deepStrictEqual(await rawItem(partition, key), {
             expiresAt: { N: '4000000060' },
             document: { S: '{"data":"x"}' },
+            seq: { N: '0' },
+            created: updated,
+            updated,
+        })
+
+        await connection.transact(
+            [
+                {
+                    op: 'put',
+                    table: 'TtlTestDocs',
+                    partition,
+                    key,
+                    document: { data: 'y' },
+                    newRevision: randomUUID(),
+                },
+            ],
+            { now: now + 60 },
+        )
+
+        assert.deepStrictEqual(await rawItem(partition, key), {
+            expiresAt: undefined,
+            document: { S: '{"data":"y"}' },
+            seq: { N: '1' },
+            created: updated,
+            updated: updatedLater,
         })
     }).timeout(60_000)
 
@@ -412,16 +714,45 @@ describe('driver', () => {
     }).timeout(120_000)
 })
 
+// The item as DynamoDB holds it, or undefined when there is none at all.
 async function rawItem(partition: string, key: string) {
     const { Item } = await dbRequest<{
-        Item?: { expiresAt?: { N: string }; document?: { S: string } }
+        Item?: {
+            expiresAt?: { N: string }
+            document?: { S: string }
+            seq?: { N: string }
+            created?: { S: string }
+            updated?: { S: string }
+        }
     }>(context.env, 'GetItem', {
         TableName: 'DocsTests.TtlTestDocs',
         Key: { partition: { S: partition }, key: { S: key } },
-        ProjectionExpression: 'expiresAt, #d',
+        ProjectionExpression: 'expiresAt, #d, seq, created, updated',
         ExpressionAttributeNames: { '#d': 'document' },
+        ConsistentRead: true,
     })
-    return { expiresAt: Item?.expiresAt, document: Item?.document }
+    if (Item === undefined) {
+        return undefined
+    }
+    return {
+        expiresAt: Item.expiresAt,
+        document: Item.document,
+        seq: Item.seq,
+        created: Item.created,
+        updated: Item.updated,
+    }
+}
+
+// Every item of the partition as DynamoDB holds it, whatever its attributes.
+async function rawPartition(partition: string) {
+    const { Items } = await dbRequest<{ Items?: { key?: { S: string } }[] }>(context.env, 'Query', {
+        TableName: 'DocsTests.TtlTestDocs',
+        KeyConditionExpression: '#p = :p',
+        ExpressionAttributeNames: { '#p': 'partition' },
+        ExpressionAttributeValues: { ':p': { S: partition } },
+        ConsistentRead: true,
+    })
+    return (Items ?? []).map(item => item.key?.S)
 }
 
 // Answers every read with an empty result and records what was asked, so a
@@ -456,7 +787,11 @@ async function createMockDynamo() {
         close: () =>
             new Promise<void>((resolve, reject) => {
                 server.close(err => {
-                    err ? reject(err) : resolve()
+                    if (err) {
+                        reject(err)
+                    } else {
+                        resolve()
+                    }
                 })
             }),
     }
