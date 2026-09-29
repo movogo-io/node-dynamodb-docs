@@ -982,28 +982,26 @@ function isErrorType(error: unknown, type: string) {
 
 // DynamoDB refuses an oversized transaction as invalid input, and refuses it
 // again on every retry. Its message names neither the tables nor the
-// operations, so the error names them and the limit. The reply is matched as
-// text, since the fetch layer keeps only the start and the end of a long
-// reply, which is then no JSON; and it is not attached to the error, since
-// the reply to a transaction over 100 items echoes the items, documents
-// included, into whatever log prints the error.
+// operations, so the error names them and the limit. It does not carry
+// DynamoDB's reply: the one to a transaction over 100 items echoes the items,
+// documents included, into whatever log prints the error.
 function exceededLimit(error: unknown) {
-    const body = responseBody(error)
-    if (!body.includes('#ValidationException"')) {
+    if (!isErrorType(error, 'ValidationException')) {
         return undefined
     }
-    if (body.includes('Transaction payload size cannot exceed')) {
-        const measured = /Payload Size: (\d+)/u.exec(body)?.[1]
+    const message = messageOf(error)
+    if (message.includes('Transaction payload size cannot exceed')) {
+        const measured = /Payload Size: (\d+)/u.exec(message)?.[1]
         if (measured) {
             return `limit of 4 MB per transaction: DynamoDB measured ${measured} bytes`
         }
         return 'limit of 4 MB per transaction'
     }
-    if (/Item size (?:to update )?has exceeded the maximum allowed size/u.test(body)) {
+    if (/Item size (?:to update )?has exceeded the maximum allowed size/u.test(message)) {
         return 'limit of 400 KB per item'
     }
     if (
-        body.includes(
+        message.includes(
             "at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
         )
     ) {
@@ -1012,12 +1010,10 @@ function exceededLimit(error: unknown) {
     return undefined
 }
 
-function responseBody(error: unknown) {
-    if (!Error.isError(error) || !('response' in error)) {
-        return ''
-    }
-    const { response } = error as { response: { body?: string } }
-    return response.body ?? ''
+function messageOf(error: unknown) {
+    const { response } = error as { response: { body: string } }
+    const body = JSON.parse(response.body) as { message?: string }
+    return body.message ?? ''
 }
 
 function isThrottledTransaction(reasons: { Code?: string }[]) {

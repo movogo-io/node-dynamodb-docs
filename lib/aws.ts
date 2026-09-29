@@ -1,4 +1,4 @@
-import { fetchJson } from '@riddance/fetch'
+import { jsonResponse } from '@riddance/fetch'
 import { SignatureV4 } from '@smithy/signature-v4'
 import { createHash, createHmac } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
@@ -155,17 +155,71 @@ async function awsStringRequest<T>(
         },
         body,
     })
-    return await fetchJson<T>(
-        uri,
-        {
-            method,
-            headers,
-            body,
-        },
-        'Error fetching DynamoDB',
-        { target },
-    )
+    const response = await fetch(uri, { method, headers, body })
+    if (!response.ok) {
+        throw Object.assign(new Error('Error fetching DynamoDB'), {
+            response: {
+                url: response.url,
+                status: response.status,
+                body: errorSummary(await response.text()),
+            },
+            target,
+        })
+    }
+    return await jsonResponse<T>(Promise.resolve(response), 'Error fetching DynamoDB', { target })
 }
+
+// The driver decides on DynamoDB's error reply: its type, and for a cancelled
+// transaction the reason for every item. That reply grows with the request,
+// ~110 characters per item of a cancellation, the whole request for a
+// transaction over 100 items, and the error of @riddance/fetch keeps 2 KB of
+// a body: a cancellation of 25 items then no longer parses, and a lost race
+// is not seen as a conflict. So the reply is reduced here, before anything
+// cuts it, to what the driver reads: the type, the reason codes, and the
+// message, shortened, since it can echo the request, documents included.
+function errorSummary(text: string) {
+    const reply = parsedReply(text)
+    if (!reply) {
+        return shortened(text)
+    }
+    return JSON.stringify({
+        __type: reply.__type,
+        message: shortened(reply.message ?? reply.Message ?? ''),
+        ...(reply.CancellationReasons && {
+            CancellationReasons: reply.CancellationReasons.map(({ Code, Message }) => ({
+                Code,
+                Message,
+            })),
+        }),
+    })
+}
+
+// A reply that is no JSON, from a proxy in front of DynamoDB say, is passed
+// on shortened as it came.
+function parsedReply(text: string) {
+    try {
+        return JSON.parse(text) as {
+            __type?: string
+            message?: string
+            Message?: string
+            CancellationReasons?: { Code?: string; Message?: string }[]
+        }
+    } catch {
+        return undefined
+    }
+}
+
+// The start names the problem and the end the constraint; what lies between
+// is the echoed request.
+function shortened(text: string) {
+    if (text.length <= shortenedHeadLength + shortenedTailLength) {
+        return text
+    }
+    return text.slice(0, shortenedHeadLength) + '…' + text.slice(-shortenedTailLength)
+}
+
+const shortenedHeadLength = 128
+const shortenedTailLength = 256
 
 type SourceData = string | ArrayBuffer | ArrayBufferView
 

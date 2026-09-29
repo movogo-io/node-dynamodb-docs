@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
+import { isConflict } from '@movogo-io/docs'
 import { setDriver } from '@movogo-io/docs/driver'
 import { docs } from '@movogo-io/docs/indexed'
 import { harness } from '@movogo-io/docs/test/harness'
@@ -257,12 +258,13 @@ describe('driver', () => {
         }
     })
 
-    it('passes any other invalid input through as DynamoDB answered it', async () => {
+    it('passes other invalid input on, reduced to what the driver reads', async () => {
         const mock = await createMockDynamo(() => ({
             status: 400,
             body: {
                 __type: 'com.amazon.coral.validate#ValidationException',
-                message: 'One or more parameter values were invalid',
+                message: `${'A'.repeat(200)} {"name":"Jane Doe"} ${'B'.repeat(300)}`,
+                echoedRequest: { name: 'Jane Doe' },
             },
         }))
         try {
@@ -290,12 +292,102 @@ describe('driver', () => {
                     ],
                     { now },
                 ),
-                (e: unknown) => Error.isError(e) && 'response' in e,
+                (e: unknown) => {
+                    assert.deepStrictEqual(
+                        e,
+                        Object.assign(new Error('Error fetching DynamoDB'), {
+                            response: {
+                                url: mock.baseUrl,
+                                status: 400,
+                                body: JSON.stringify({
+                                    __type: 'com.amazon.coral.validate#ValidationException',
+                                    message: `${'A'.repeat(128)}…${'B'.repeat(256)}`,
+                                }),
+                            },
+                            target: 'DynamoDB_20120810.TransactWriteItems',
+                        }),
+                    )
+                    return true
+                },
             )
-            assert.strictEqual(mock.requests.length, 1)
         } finally {
             await mock.close()
         }
+    })
+
+    it('backs off a throttled transaction of many items', async () => {
+        const codes = Array.from({ length: 100 }, (_, i) => (i === 99 ? 'ThrottlingError' : 'None'))
+        let requested = 0
+        const mock = await createMockDynamo(target => {
+            if (target !== 'DynamoDB_20120810.TransactWriteItems') {
+                return mockResponse(target, {})
+            }
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                        message: `Transaction cancelled, please refer cancellation reasons for specific reasons [${codes.join(', ')}]`,
+                        CancellationReasons: codes.map(Code =>
+                            Code === 'None'
+                                ? { Code }
+                                : {
+                                      Code,
+                                      Message:
+                                          'Throughput exceeds the current capacity of your table or index.',
+                                  },
+                        ),
+                    },
+                }
+            }
+            return { status: 200, body: {} }
+        })
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+
+            await connection.transact(
+                codes.map((_, i) => ({
+                    op: 'check',
+                    table: 'Docs',
+                    partition: 'p',
+                    key: `k${String(i)}`,
+                    revision: 'r',
+                })),
+                { now },
+            )
+
+            assert.strictEqual(requested, 2)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('sees a lost race in a transaction of many items as a conflict', async () => {
+        const connection = await new Driver().connect(context)
+        const partition = randomUUID()
+
+        await assert.rejects(
+            connection.transact(
+                Array.from({ length: 30 }, (_, i) => ({
+                    op: 'check',
+                    table: 'IndexTestDocs',
+                    partition,
+                    key: `k${String(i)}`,
+                    revision: randomUUID(),
+                })),
+                { now },
+            ),
+            isConflict,
+        )
     })
 
     it('reads seq 0 and the epoch from an item written without them', async () => {
