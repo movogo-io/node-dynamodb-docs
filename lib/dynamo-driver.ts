@@ -414,6 +414,13 @@ class Connection {
             }
             throw e
         }
+        const limit = exceededLimit(e)
+        if (limit) {
+            throw new Error(
+                `Transaction of ${String(items.length)} operations on ${[...new Set(items.map(item => `'${item.table}'`))].join(', ')} exceeds the ${limit}.`,
+                { cause: e },
+            )
+        }
         if (isErrorType(e, 'TransactionInProgressException') && attempt < throttleAttemptsMax) {
             await backoff(attempt)
             return
@@ -971,6 +978,33 @@ function isErrorType(error: unknown, type: string) {
         return body.__type?.includes(type) ?? false
     } catch {
         return false
+    }
+}
+
+// DynamoDB refuses an oversized transaction as invalid input, and refuses it
+// again on every retry. Its message names neither the tables nor the
+// operations, so the error names them and the limit.
+function exceededLimit(error: unknown) {
+    if (!isErrorType(error, 'ValidationException')) {
+        return undefined
+    }
+    const message = errorMessage(error)
+    if (message.includes('Transaction payload size cannot exceed')) {
+        return 'limit of 4 MB per transaction'
+    }
+    if (/Item size (?:to update )?has exceeded the maximum allowed size/u.test(message)) {
+        return 'limit of 400 KB per item'
+    }
+    return undefined
+}
+
+function errorMessage(error: unknown) {
+    const { response } = error as { response: { body: string } }
+    try {
+        const body = JSON.parse(response.body) as { message?: string; Message?: string }
+        return body.message ?? body.Message ?? ''
+    } catch {
+        return ''
     }
 }
 

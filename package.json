@@ -1,7 +1,7 @@
 {
   "name": "@movogo-io/dynamodb-docs",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },

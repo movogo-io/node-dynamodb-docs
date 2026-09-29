@@ -105,6 +105,144 @@ describe('driver', () => {
         }
     })
 
+    it('names the transaction limit DynamoDB refuses, without retrying', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazon.coral.validate#ValidationException',
+                message:
+                    'Transaction payload size cannot exceed 4MB. Payload Size: : Transaction payload size cannot exceed 4MB. Payload Size: 4306456',
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+
+            await assert.rejects(
+                connection.transact(
+                    [
+                        {
+                            op: 'add',
+                            table: 'Docs',
+                            partition: 'p',
+                            key: 'k1',
+                            document: {},
+                            newRevision: 'r1',
+                        },
+                        {
+                            op: 'add',
+                            table: 'Docs.byUnit',
+                            partition: 'u',
+                            key: 'k1',
+                            document: {},
+                            newRevision: 'r1',
+                        },
+                    ],
+                    { now },
+                ),
+                {
+                    message:
+                        "Transaction of 2 operations on 'Docs', 'Docs.byUnit' exceeds the limit of 4 MB per transaction.",
+                },
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('names the item limit DynamoDB refuses, without retrying', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazon.coral.validate#ValidationException',
+                message: 'Item size to update has exceeded the maximum allowed size',
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+
+            await assert.rejects(
+                connection.transact(
+                    [
+                        {
+                            op: 'add',
+                            table: 'Docs',
+                            partition: 'p',
+                            key: 'k1',
+                            document: {},
+                            newRevision: 'r1',
+                        },
+                    ],
+                    { now },
+                ),
+                {
+                    message:
+                        "Transaction of 1 operations on 'Docs' exceeds the limit of 400 KB per item.",
+                },
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('passes any other invalid input through as DynamoDB answered it', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazon.coral.validate#ValidationException',
+                message: 'One or more parameter values were invalid',
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+
+            await assert.rejects(
+                connection.transact(
+                    [
+                        {
+                            op: 'add',
+                            table: 'Docs',
+                            partition: 'p',
+                            key: 'k1',
+                            document: {},
+                            newRevision: 'r1',
+                        },
+                    ],
+                    { now },
+                ),
+                (e: unknown) => Error.isError(e) && 'response' in e,
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
+    })
+
     it('reads seq 0 and the epoch from an item written without them', async () => {
         const mock = await createMockDynamo()
         try {
@@ -757,7 +895,7 @@ async function rawPartition(partition: string) {
 
 // Answers every read with an empty result and records what was asked, so a
 // test can see the request shape; nothing here reaches a real account.
-async function createMockDynamo() {
+async function createMockDynamo(respond = mockResponse) {
     const requests: { target: string | string[] | undefined; body: unknown }[] = []
     const server = await new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
         const s = createServer((req, res) => {
@@ -768,8 +906,9 @@ async function createMockDynamo() {
             })
             req.on('end', () => {
                 requests.push({ target: req.headers['x-amz-target'], body: JSON.parse(body) })
-                res.writeHead(200, { 'content-type': 'application/json' })
-                res.end(JSON.stringify(mockResponse(req.headers['x-amz-target'])))
+                const response = respond(req.headers['x-amz-target'])
+                res.writeHead(response.status, { 'content-type': 'application/json' })
+                res.end(JSON.stringify(response.body))
             })
         })
         s.on('error', reject)
@@ -797,19 +936,22 @@ async function createMockDynamo() {
     }
 }
 
-function mockResponse(target: string | string[] | undefined) {
+function mockResponse(target: string | string[] | undefined): { status: number; body: unknown } {
     if (target === 'DynamoDB_20120810.GetItem') {
         return {
-            Item: {
-                partition: { S: 'p' },
-                key: { S: 'k' },
-                revision: { S: 'r' },
-                document: { S: '{}' },
+            status: 200,
+            body: {
+                Item: {
+                    partition: { S: 'p' },
+                    key: { S: 'k' },
+                    revision: { S: 'r' },
+                    document: { S: '{}' },
+                },
             },
         }
     }
     if (target === 'DynamoDB_20120810.BatchGetItem') {
-        return { Responses: {} }
+        return { status: 200, body: { Responses: {} } }
     }
-    return { Items: [] }
+    return { status: 200, body: { Items: [] } }
 }
