@@ -418,7 +418,6 @@ class Connection {
         if (limit) {
             throw new Error(
                 `Transaction of ${String(items.length)} operations on ${[...new Set(items.map(item => `'${item.table}'`))].join(', ')} exceeds the ${limit}.`,
-                { cause: e },
             )
         }
         if (isErrorType(e, 'TransactionInProgressException') && attempt < throttleAttemptsMax) {
@@ -983,29 +982,42 @@ function isErrorType(error: unknown, type: string) {
 
 // DynamoDB refuses an oversized transaction as invalid input, and refuses it
 // again on every retry. Its message names neither the tables nor the
-// operations, so the error names them and the limit.
+// operations, so the error names them and the limit. The reply is matched as
+// text, since the fetch layer keeps only the start and the end of a long
+// reply, which is then no JSON; and it is not attached to the error, since
+// the reply to a transaction over 100 items echoes the items, documents
+// included, into whatever log prints the error.
 function exceededLimit(error: unknown) {
-    if (!isErrorType(error, 'ValidationException')) {
+    const body = responseBody(error)
+    if (!body.includes('#ValidationException"')) {
         return undefined
     }
-    const message = errorMessage(error)
-    if (message.includes('Transaction payload size cannot exceed')) {
+    if (body.includes('Transaction payload size cannot exceed')) {
+        const measured = /Payload Size: (\d+)/u.exec(body)?.[1]
+        if (measured) {
+            return `limit of 4 MB per transaction: DynamoDB measured ${measured} bytes`
+        }
         return 'limit of 4 MB per transaction'
     }
-    if (/Item size (?:to update )?has exceeded the maximum allowed size/u.test(message)) {
+    if (/Item size (?:to update )?has exceeded the maximum allowed size/u.test(body)) {
         return 'limit of 400 KB per item'
+    }
+    if (
+        body.includes(
+            "at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100",
+        )
+    ) {
+        return 'limit of 100 operations per transaction'
     }
     return undefined
 }
 
-function errorMessage(error: unknown) {
-    const { response } = error as { response: { body: string } }
-    try {
-        const body = JSON.parse(response.body) as { message?: string; Message?: string }
-        return body.message ?? body.Message ?? ''
-    } catch {
+function responseBody(error: unknown) {
+    if (!Error.isError(error) || !('response' in error)) {
         return ''
     }
+    const { response } = error as { response: { body?: string } }
+    return response.body ?? ''
 }
 
 function isThrottledTransaction(reasons: { Code?: string }[]) {

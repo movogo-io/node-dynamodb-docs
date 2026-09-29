@@ -93,7 +93,22 @@ export function dbRequest<T>(env: Partial<LocalEnv> | undefined, target: string,
         JSON.stringify(body),
         'application/json',
         'DynamoDB_20120810.' + target,
+        acceptEncodingOf(target),
     )
+}
+
+// DynamoDB compresses the replies it is asked to, which shrinks a 1 MB page
+// of documents to kilobytes, but a large error reply to TransactWriteItems
+// (one listing every item of a transaction over 100) it labels gzip or
+// deflate and sends uncompressed, and fetch then fails decoding it with
+// nothing but 'terminated'. A transaction answers `{}` when it succeeds, so
+// asking it for an uncompressed reply costs nothing and keeps its errors
+// readable.
+function acceptEncodingOf(target: string) {
+    if (target === 'TransactWriteItems') {
+        return 'identity'
+    }
+    return undefined
 }
 
 function missing(what?: string): never {
@@ -108,6 +123,7 @@ async function awsStringRequest<T>(
     body: string,
     contentType: string,
     target: string,
+    acceptEncoding: string | undefined,
 ) {
     const signer = new SignatureV4({
         service,
@@ -135,6 +151,7 @@ async function awsStringRequest<T>(
             'content-type': contentType,
             accept: 'application/json',
             ...(target && { 'X-Amz-Target': target }),
+            ...(acceptEncoding && { 'accept-encoding': acceptEncoding }),
         },
         body,
     })

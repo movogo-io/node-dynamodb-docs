@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { createServer } from 'node:http'
+import { createServer, type IncomingHttpHeaders } from 'node:http'
 import { setDriver } from '@movogo-io/docs/driver'
 import { docs } from '@movogo-io/docs/indexed'
 import { harness } from '@movogo-io/docs/test/harness'
@@ -149,7 +149,7 @@ describe('driver', () => {
                 ),
                 {
                     message:
-                        "Transaction of 2 operations on 'Docs', 'Docs.byUnit' exceeds the limit of 4 MB per transaction.",
+                        "Transaction of 2 operations on 'Docs', 'Docs.byUnit' exceeds the limit of 4 MB per transaction: DynamoDB measured 4306456 bytes.",
                 },
             )
             assert.strictEqual(mock.requests.length, 1)
@@ -194,6 +194,61 @@ describe('driver', () => {
                 {
                     message:
                         "Transaction of 1 operations on 'Docs' exceeds the limit of 400 KB per item.",
+                },
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('reads the refusal of a transaction over 100 items, which DynamoDB mislabels as compressed', async () => {
+        const echoedItems = Array.from(
+            { length: 101 },
+            (_, i) =>
+                `TransactWriteItem(put=Put(item={document=AttributeValue(s={"name":"Jane Doe ${String(i)}"})}))`,
+        ).join(', ')
+        const mock = await createMockDynamo((_target, headers) => ({
+            status: 400,
+            headers: headers['accept-encoding']?.includes('gzip')
+                ? { 'content-encoding': 'gzip' }
+                : undefined,
+            body: {
+                __type: 'com.amazon.coral.validate#ValidationException',
+                message: `1 validation error detected: Value '[${echoedItems}]' at 'transactItems' failed to satisfy constraint: Member must have length less than or equal to 100`,
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({
+                env: {
+                    AWS_REGION: 'eu-north-1',
+                    AWS_ACCESS_KEY_ID: 'mock',
+                    AWS_SECRET_ACCESS_KEY: 'mock',
+                    AWS_DYNAMODB_ENDPOINT: mock.baseUrl,
+                    TABLE_PREFIX: 'Mock.',
+                },
+            })
+
+            await assert.rejects(
+                connection.transact(
+                    Array.from({ length: 101 }, (_, i) => ({
+                        op: 'add',
+                        table: 'Docs',
+                        partition: 'p',
+                        key: `k${String(i)}`,
+                        document: { name: `Jane Doe ${String(i)}` },
+                        newRevision: `r${String(i)}`,
+                    })),
+                    { now },
+                ),
+                (e: unknown) => {
+                    assert.deepStrictEqual(
+                        e,
+                        new Error(
+                            "Transaction of 101 operations on 'Docs' exceeds the limit of 100 operations per transaction.",
+                        ),
+                    )
+                    return true
                 },
             )
             assert.strictEqual(mock.requests.length, 1)
@@ -906,8 +961,11 @@ async function createMockDynamo(respond = mockResponse) {
             })
             req.on('end', () => {
                 requests.push({ target: req.headers['x-amz-target'], body: JSON.parse(body) })
-                const response = respond(req.headers['x-amz-target'])
-                res.writeHead(response.status, { 'content-type': 'application/json' })
+                const response = respond(req.headers['x-amz-target'], req.headers)
+                res.writeHead(response.status, {
+                    'content-type': 'application/json',
+                    ...response.headers,
+                })
                 res.end(JSON.stringify(response.body))
             })
         })
@@ -936,7 +994,10 @@ async function createMockDynamo(respond = mockResponse) {
     }
 }
 
-function mockResponse(target: string | string[] | undefined): { status: number; body: unknown } {
+function mockResponse(
+    target: string | string[] | undefined,
+    _headers: IncomingHttpHeaders,
+): { status: number; headers?: { [name: string]: string }; body: unknown } {
     if (target === 'DynamoDB_20120810.GetItem') {
         return {
             status: 200,
