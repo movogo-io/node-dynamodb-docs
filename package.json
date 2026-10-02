@@ -44,7 +44,7 @@
     "@movogo-io/docs": ">=0.1.0 <0.3"
   },
   "devDependencies": {
-    "@movogo-io/docs": "^0.2.0",
+    "@movogo-io/docs": "^0.2.4",
     "@riddance/env": "0.10.2"
   },
   "allowScripts": {
