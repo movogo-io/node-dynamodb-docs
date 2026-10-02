@@ -1,7 +1,7 @@
 {
   "name": "@movogo-io/dynamodb-docs",
   "type": "module",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
@@ -44,7 +44,7 @@
     "@movogo-io/docs": ">=0.1.0 <0.3"
   },
   "devDependencies": {
-    "@movogo-io/docs": "^0.2.4",
+    "@movogo-io/docs": "^0.2.5",
     "@riddance/env": "0.10.2"
   },
   "allowScripts": {

@@ -59,12 +59,15 @@ const backoffDelayMsMax = 3200
 const tableCreationAttemptsMax = 60
 const tableCreationDelayMs = 1000
 
-type WriteOptions = { now: number; expiresAt?: number }
+type WriteOptions = { now: number; expiresAt?: number; newRevision?: unknown }
 
 class Connection {
     // What the store may assume of this connection, so it bounds nothing itself.
     readonly requestsInFlightMax
     readonly transactionItemsMax = transactionItemsMax
+    // `add` and `update` store the revision the store hands them, as a
+    // transaction stores an item's.
+    readonly acceptsNewRevision = true
     readonly #context
     readonly #consistentRead
     readonly #requestTimeoutMs
@@ -93,7 +96,7 @@ class Connection {
                     this.#tableName(table),
                     partition,
                     key,
-                    randomUUID().replaceAll('-', ''),
+                    options.newRevision ?? randomUUID().replaceAll('-', ''),
                     document,
                     options.expiresAt,
                     isoOf(options.now),
@@ -301,7 +304,7 @@ class Connection {
                     partition,
                     key,
                     currentRevision,
-                    randomUUID().replaceAll('-', ''),
+                    options.newRevision ?? randomUUID().replaceAll('-', ''),
                     document,
                     options,
                     isoOf(options.now),
