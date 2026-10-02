@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingHttpHeaders, type ServerResponse } from 'node:http'
 import { setTimeout } from 'node:timers/promises'
-import { isConflict } from '@movogo-io/docs'
-import { setDriver } from '@movogo-io/docs/driver'
+import { isConflict, isTransactionTooLarge, transactEach } from '@movogo-io/docs'
+import { declaredLimits, setDriver } from '@movogo-io/docs/driver'
 import { docs } from '@movogo-io/docs/indexed'
 import { harness } from '@movogo-io/docs/test/harness'
 import { dbRequest, localAwsEnv, type LocalEnv } from '../lib/aws.js'
@@ -23,6 +23,7 @@ const updatedLater = { S: '2096-10-02T07:07:40.000Z' }
 
 type Schema = {
     IndexTestDocs: { [partition: string]: { [key: string]: { unitId: string } } }
+    BulkTestDocs: { [partition: string]: { [key: string]: { name: string; count: number } } }
 }
 
 const schema = docs<Schema>()
@@ -1105,6 +1106,116 @@ describe('driver', () => {
                 document: { unitId: secondUnit },
                 source: { partition, key },
             })
+        } finally {
+            setDriver(previous)
+        }
+    }).timeout(90_000)
+
+    it('answers the bounds it declares to the store', async () => {
+        const previous = setDriver(new Driver({ requestsInFlightMax: 4 }))
+        try {
+            assert.deepStrictEqual(await declaredLimits(context), {
+                requestsInFlightMax: 4,
+                transactionItemsMax: 100,
+            })
+        } finally {
+            setDriver(previous)
+        }
+    })
+
+    it('has the store write in windows of the bound it declares', async () => {
+        const previous = setDriver(new Driver({ requestsInFlightMax: 4 }))
+        try {
+            await using stored = schema.tables(context)
+            const partition = randomUUID()
+            const keys = Array.from({ length: 10 }, (_, i) => `k${String(i)}`)
+            let running = 0
+            let runningPeak = 0
+
+            await transactEach<Schema, string>(context, keys, async (tx, key) => {
+                running += 1
+                runningPeak = Math.max(runningPeak, running)
+                try {
+                    await tx.BulkTestDocs.partition(partition).add(key, { name: key, count: 1 })
+                    await setTimeout(20)
+                } finally {
+                    running -= 1
+                }
+            })
+
+            assert.strictEqual(runningPeak, 4)
+            assert.deepStrictEqual(
+                await Array.fromAsync(
+                    stored.BulkTestDocs.partition(partition).getAll(),
+                    row => row.key,
+                ),
+                ['k0', 'k1', 'k2', 'k3', 'k4', 'k5', 'k6', 'k7', 'k8', 'k9'],
+            )
+        } finally {
+            setDriver(previous)
+        }
+    }).timeout(90_000)
+
+    it('has the store apply two units that write one document in item order', async () => {
+        const previous = setDriver(new Driver())
+        try {
+            await using stored = schema.tables(context)
+            const partition = randomUUID()
+            await stored.BulkTestDocs.partition(partition).add('k', { name: '', count: 0 })
+            const runs: string[] = []
+
+            await transactEach<Schema, string>(
+                context,
+                ['first', 'second'],
+                async (tx, name) => {
+                    runs.push(name)
+                    const row = await tx.BulkTestDocs.partition(partition).get('k', {
+                        consistent: true,
+                    })
+                    await tx.BulkTestDocs.partition(partition).update('k', row.revision, {
+                        name,
+                        count: row.document.count + 1,
+                    })
+                },
+                { retries: 0 },
+            )
+
+            assert.deepStrictEqual(runs, ['first', 'second', 'second'])
+            assert.deepStrictEqual(
+                (await stored.BulkTestDocs.partition(partition).get('k', { consistent: true }))
+                    .document,
+                { name: 'second', count: 2 },
+            )
+        } finally {
+            setDriver(previous)
+        }
+    }).timeout(90_000)
+
+    it('has the store refuse a unit of more than 100 operations and commit the others', async () => {
+        const previous = setDriver(new Driver())
+        try {
+            await using stored = schema.tables(context)
+            const partition = randomUUID()
+
+            await assert.rejects(
+                transactEach<Schema, number>(context, [1, 101], async (tx, count) => {
+                    for (let i = 0; i !== count; ++i) {
+                        await tx.BulkTestDocs.partition(partition).add(
+                            `k${String(count)}-${String(i)}`,
+                            { name: 'a', count: i },
+                        )
+                    }
+                }),
+                isTransactionTooLarge,
+            )
+
+            assert.deepStrictEqual(
+                await Array.fromAsync(
+                    stored.BulkTestDocs.partition(partition).getAll(),
+                    row => row.key,
+                ),
+                ['k1-0'],
+            )
         } finally {
             setDriver(previous)
         }
