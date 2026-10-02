@@ -4,7 +4,7 @@
 // the bound is there to prevent and what it costs:
 //
 //   TABLE_PREFIX=staging.measure. AWS_PROFILE=staging node bin/measure-in-flight.js \
-//       [--rows 500] [--bounds 8,16,32,64] [--alongside https://host/path]...
+//       [--rows 500] [--bounds 32,64,128,256] [--alongside https://host/path]...
 //
 // For every bound it runs two bursts of `--rows` concurrent operations on one
 // partition, the shape of a tenant-sized list in one handler: reads (GetItem),
@@ -43,7 +43,7 @@ async function main() {
     const { values } = parseArgs({
         options: {
             rows: { type: 'string', default: '500' },
-            bounds: { type: 'string', default: '8,16,32,64' },
+            bounds: { type: 'string', default: '32,64,128,256' },
             alongside: { type: 'string', multiple: true, default: [] },
             run: { type: 'string' },
         },

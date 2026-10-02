@@ -83,7 +83,7 @@ export async function localAwsEnv(region?: string, profile?: string): Promise<Lo
 // in flight opens a connection of its own, and on a cold one a TLS handshake
 // and a DNS lookup; a burst over a tenant-sized list has failed a production
 // request outright with `getaddrinfo EBUSY`.
-export const requestsInFlightDefault = 16
+export const requestsInFlightDefault = 64
 
 // How long one attempt may take, its wait for a connection included. Without
 // it a request stalled on a socket that died while the process was frozen

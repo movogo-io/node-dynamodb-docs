@@ -346,7 +346,7 @@ describe('driver', () => {
         const plain = await new Driver().connect({ env: mockEnv('') })
 
         assert.strictEqual(bounded.requestsInFlightMax, 8)
-        assert.strictEqual(plain.requestsInFlightMax, 16)
+        assert.strictEqual(plain.requestsInFlightMax, 64)
         assert.strictEqual(bounded.transactionItemsMax, 100)
     })
 
