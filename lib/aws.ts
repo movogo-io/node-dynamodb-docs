@@ -78,7 +78,33 @@ export async function localAwsEnv(region?: string, profile?: string): Promise<Lo
     }
 }
 
-export function dbRequest<T>(env: Partial<LocalEnv> | undefined, target: string, body: unknown) {
+// How many requests the driver holds in flight, which is how many connections
+// it opens: a request past it waits for one. Without the bound, every request
+// in flight opens a connection of its own, and on a cold one a TLS handshake
+// and a DNS lookup; a burst over a tenant-sized list has failed a production
+// request outright with `getaddrinfo EBUSY`.
+export const requestsInFlightDefault = 16
+
+// How long one attempt may take, its wait for a connection included. Without
+// it a request stalled on a socket that died while the process was frozen
+// holds its connection for every later invocation. A request is signed before
+// it waits, so this must stay well inside the minutes a signature is valid.
+export const requestTimeoutMsDefault = 10_000
+
+export type RequestOptions = {
+    // Aborts the request. Only for reads: a write that was sent may have been
+    // applied, and aborting it would report as failed what committed.
+    signal?: AbortSignal
+    timeoutMs?: number
+    requestsInFlightMax?: number
+}
+
+export function dbRequest<T>(
+    env: Partial<LocalEnv> | undefined,
+    target: string,
+    body: unknown,
+    options?: RequestOptions,
+) {
     const region = env?.AWS_REGION ?? missing('AWS_REGION')
     return awsStringRequest<T>(
         {
@@ -94,6 +120,7 @@ export function dbRequest<T>(env: Partial<LocalEnv> | undefined, target: string,
         'application/json',
         'DynamoDB_20120810.' + target,
         acceptEncodingOf(target),
+        options,
     )
 }
 
@@ -124,6 +151,7 @@ async function awsStringRequest<T>(
     contentType: string,
     target: string,
     acceptEncoding: string | undefined,
+    options: RequestOptions | undefined,
 ) {
     const signer = new SignatureV4({
         service,
@@ -155,7 +183,7 @@ async function awsStringRequest<T>(
         },
         body,
     })
-    const response = await fetch(uri, { method, headers, body })
+    const response = await answered(uri, { method, headers, body }, target, options)
     if (!response.ok) {
         throw Object.assign(new Error('Error fetching DynamoDB'), {
             response: {
@@ -167,6 +195,68 @@ async function awsStringRequest<T>(
         })
     }
     return await jsonResponse<T>(Promise.resolve(response), 'Error fetching DynamoDB', { target })
+}
+
+// A request DynamoDB did not answer, by the timeout or a failed connection, is
+// marked `unanswered`: for a write, nobody knows whether it was applied. An
+// abort by the caller's own signal is passed on as it is.
+async function answered(
+    uri: URL,
+    request: { method: string; headers: { [name: string]: string }; body: string },
+    target: string,
+    options: RequestOptions | undefined,
+) {
+    const timeoutMs = options?.timeoutMs ?? requestTimeoutMsDefault
+    const timeout = AbortSignal.timeout(timeoutMs)
+    try {
+        return await fetch(uri, {
+            ...request,
+            signal: options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
+            dispatcher: dispatcherOf(options?.requestsInFlightMax ?? requestsInFlightDefault),
+        })
+    } catch (e) {
+        if (options?.signal?.aborted) {
+            throw e
+        }
+        throw Object.assign(
+            new Error(
+                timeout.aborted
+                    ? `DynamoDB did not answer within ${String(timeoutMs)} ms.`
+                    : 'DynamoDB could not be reached.',
+                { cause: e },
+            ),
+            { target, unanswered: true },
+        )
+    }
+}
+
+// spell-checker: ignore undici
+// Node's fetch opens a connection whenever all the ones it has are busy,
+// without limit. Its dispatcher takes a cap, but the class is not exported:
+// it is reached through the global dispatcher fetch itself uses.
+type Dispatcher = NonNullable<RequestInit['dispatcher']>
+
+const dispatchers = new Map<number, Dispatcher>()
+
+function dispatcherOf(connections: number) {
+    const existing = dispatchers.get(connections)
+    if (existing) {
+        return existing
+    }
+    const global: unknown = Reflect.get(globalThis, Symbol.for('undici.globalDispatcher.1'))
+    if (typeof global !== 'object' || global === null) {
+        throw new Error('The dispatcher of fetch was not found; the driver needs Node 24.')
+    }
+    const dispatcher: unknown = Reflect.construct(global.constructor, [{ connections }])
+    if (!isDispatcher(dispatcher)) {
+        throw new Error('The dispatcher of fetch could not be constructed.')
+    }
+    dispatchers.set(connections, dispatcher)
+    return dispatcher
+}
+
+function isDispatcher(value: unknown): value is Dispatcher {
+    return typeof value === 'object' && value !== null && 'dispatch' in value
 }
 
 // The driver decides on DynamoDB's error reply: its type, and for a cancelled

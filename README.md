@@ -15,6 +15,17 @@ The driver reads these from the context's `env`:
 
 Tables are created on first write, so no provisioning step is needed. A table's first write waits for the table to become active, which takes several seconds.
 
+## Connections, timeouts and lost replies
+
+The driver bounds what it holds in flight, so nothing above it has to. Node's `fetch` opens a connection whenever all the ones it has are busy, without limit: 200 concurrent requests open 200 connections, each with a TLS handshake and a DNS lookup on a cold start, and a burst over a tenant-sized list has failed a production request outright with `getaddrinfo EBUSY`. The driver sends through a dispatcher of its own, capped at `requestsInFlightMax` connections; a request past the cap waits for one. The connection it hands the store declares that number as `requestsInFlightMax`, and `transactionItemsMax` (100), so the store sizes its own work from what the driver enforces instead of assuming it.
+
+`new Driver({ requestsInFlightMax, requestTimeoutMs })` sets both; the defaults are 16 and 10 seconds. **The 16 is the number services bounded themselves at before the driver did, not a measured one**: `bin/measure-in-flight.ts` measures a stage at several bounds, and the default is to be set from that.
+
+- **Every attempt has a timeout**, its wait for a connection included. A request that is not answered in time is given up with an error marked `unanswered`, and its connection is freed: without it, a request stalled on a socket that died while the process was frozen holds a connection for every later invocation.
+- **The signal of the context aborts reads, and the waits between attempts.** It never aborts a write that was sent: that write may have been applied, and aborting it would report as failed what committed.
+- **A transaction whose reply was lost is sent again under the same token.** A reply is lost when DynamoDB answers a 5xx, the connection fails, or the timeout passes. DynamoDB applies a token at most once, so the resend commits the transaction or learns that it already did. It is never reported as a conflict, which would have the store build and write it anew. A single write (`add`, `update`, `delete`) whose reply is lost throws, as before: nobody knows whether it was applied.
+- **More than 100 operations are refused before anything is sent**, with the error `isTransactionTooLarge` of `@movogo-io/docs` recognizes; so is a transaction DynamoDB itself refuses for its size.
+
 ## Batch reads
 
 `findEach` in `@movogo-io/docs` hands the driver a whole list of keys, which it reads through `BatchGetItem`: at most 100 keys per request, at most four requests in flight. DynamoDB answers a request it could not finish — a throttle, or 16MB of items — with a 200 and the keys it skipped, so the driver resubmits those with the same backoff it uses for throttled requests, and throws once the attempts are spent. It never answers with part of a list: the store cannot tell a short answer from documents that have been deleted, and would report the difference as missing.

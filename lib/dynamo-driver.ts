@@ -2,11 +2,22 @@ import { randomUUID } from 'node:crypto'
 import { setTimeout } from 'node:timers/promises'
 import type { ReadOptions, TransactionItem, Written } from '@movogo-io/docs/driver'
 import type { KeyRange } from '@movogo-io/docs/schema'
-import { dbRequest } from './aws.js'
+import { dbRequest, requestsInFlightDefault, requestTimeoutMsDefault } from './aws.js'
 
 export class Driver {
+    readonly #bounds
+
+    constructor(bounds?: { requestsInFlightMax?: number; requestTimeoutMs?: number }) {
+        this.#bounds = {
+            requestsInFlightMax: bounds?.requestsInFlightMax ?? requestsInFlightDefault,
+            requestTimeoutMs: bounds?.requestTimeoutMs ?? requestTimeoutMsDefault,
+        }
+    }
+
     connect(context: Context) {
-        return Promise.try(() => new Connection(context, consistentReads(context.env)))
+        return Promise.try(
+            () => new Connection(context, consistentReads(context.env), this.#bounds),
+        )
     }
 }
 
@@ -35,6 +46,8 @@ type Environment = {
 }
 
 const throttleAttemptsMax = 8
+// TransactWriteItems takes at most 100 operations.
+const transactionItemsMax = 100
 // BatchGetItem reads at most 100 keys, and answers at most 16MB; whatever it
 // could not read comes back as unprocessed keys with a 200, not as an error.
 const batchGetKeysMax = 100
@@ -49,12 +62,22 @@ const tableCreationDelayMs = 1000
 type WriteOptions = { now: number; expiresAt?: number }
 
 class Connection {
+    // What the store may assume of this connection, so it bounds nothing itself.
+    readonly requestsInFlightMax
+    readonly transactionItemsMax = transactionItemsMax
     readonly #context
     readonly #consistentRead
+    readonly #requestTimeoutMs
 
-    constructor(context: Context, consistentRead: boolean) {
+    constructor(
+        context: Context,
+        consistentRead: boolean,
+        bounds: { requestsInFlightMax: number; requestTimeoutMs: number },
+    ) {
         this.#context = context
         this.#consistentRead = consistentRead
+        this.requestsInFlightMax = bounds.requestsInFlightMax
+        this.#requestTimeoutMs = bounds.requestTimeoutMs
     }
 
     async add(
@@ -82,7 +105,7 @@ class Connection {
         } catch (e) {
             if (isErrorType(e, 'ResourceNotFoundException')) {
                 await this.#createTable(table)
-                await setTimeout(tableCreationDelayMs)
+                await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
                 return this.add(table, partition, key, document, options)
             }
             if (isErrorType(e, 'ResourceInUseException')) {
@@ -93,7 +116,7 @@ class Connection {
                         table,
                     },
                 )
-                await setTimeout(tableCreationDelayMs)
+                await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
                 return this.add(table, partition, key, document, options)
             }
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
@@ -114,11 +137,15 @@ class Connection {
                 Item?: {
                     [key: string]: AttributeValue
                 }
-            }>('GetItem', {
-                TableName: this.#tableName(table),
-                ...(this.#consistent(options) && { ConsistentRead: true }),
-                Key: itemKey(partition, key),
-            })
+            }>(
+                'GetItem',
+                {
+                    TableName: this.#tableName(table),
+                    ...(this.#consistent(options) && { ConsistentRead: true }),
+                    Key: itemKey(partition, key),
+                },
+                this.#context.signal,
+            )
 
             if (!result.Item) {
                 throw notFound()
@@ -166,17 +193,21 @@ class Connection {
             const seen = new Set<string>()
 
             for (;;) {
-                const result = await this.#request<QueryResponse>('Scan', {
-                    TableName: this.#tableName(table),
-                    ...(this.#consistentRead && { ConsistentRead: true }),
-                    ProjectionExpression: '#p',
-                    ExpressionAttributeNames: {
-                        '#p': 'partition',
+                const result = await this.#request<QueryResponse>(
+                    'Scan',
+                    {
+                        TableName: this.#tableName(table),
+                        ...(this.#consistentRead && { ConsistentRead: true }),
+                        ProjectionExpression: '#p',
+                        ExpressionAttributeNames: {
+                            '#p': 'partition',
+                        },
+                        ...(lastEvaluatedKey !== undefined && {
+                            ExclusiveStartKey: lastEvaluatedKey,
+                        }),
                     },
-                    ...(lastEvaluatedKey !== undefined && {
-                        ExclusiveStartKey: lastEvaluatedKey,
-                    }),
-                })
+                    this.#context.signal,
+                )
 
                 if (result.Items !== undefined) {
                     for (const item of result.Items) {
@@ -213,14 +244,18 @@ class Connection {
             let lastEvaluatedKey: unknown
 
             for (;;) {
-                const result = await this.#request<QueryResponse>('Query', {
-                    TableName: this.#tableName(table),
-                    ...(this.#consistent(options) && { ConsistentRead: true }),
-                    ...(lastEvaluatedKey !== undefined && {
-                        ExclusiveStartKey: lastEvaluatedKey,
-                    }),
-                    ...queryFromRange(partition, range),
-                })
+                const result = await this.#request<QueryResponse>(
+                    'Query',
+                    {
+                        TableName: this.#tableName(table),
+                        ...(this.#consistent(options) && { ConsistentRead: true }),
+                        ...(lastEvaluatedKey !== undefined && {
+                            ExclusiveStartKey: lastEvaluatedKey,
+                        }),
+                        ...queryFromRange(partition, range),
+                    },
+                    this.#context.signal,
+                )
 
                 if (result.Items !== undefined) {
                     yield* result.Items.map(item => {
@@ -289,7 +324,7 @@ class Connection {
                         table,
                     },
                 )
-                await setTimeout(tableCreationDelayMs)
+                await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
                 return this.update(table, partition, key, currentRevision, document, options)
             }
             if (isErrorType(e, 'ResourceNotFoundException')) {
@@ -329,6 +364,9 @@ class Connection {
     }
 
     async transact(items: TransactionItem[], options: { now: number }) {
+        if (transactionItemsMax < items.length) {
+            throw transactionTooLarge(items, 'limit of 100 operations per transaction')
+        }
         const timestamp = isoOf(options.now)
         const request = {
             TransactItems: items.map(item => this.#transactItem(item, options.now, timestamp)),
@@ -365,14 +403,18 @@ class Connection {
         )
         for (let attempt = 1; ; attempt++) {
             try {
-                const result = await this.#request<BatchGetResponse>('BatchGetItem', {
-                    RequestItems: {
-                        [tableName]: {
-                            Keys: keys,
-                            ...(this.#consistent(options) && { ConsistentRead: true }),
+                const result = await this.#request<BatchGetResponse>(
+                    'BatchGetItem',
+                    {
+                        RequestItems: {
+                            [tableName]: {
+                                Keys: keys,
+                                ...(this.#consistent(options) && { ConsistentRead: true }),
+                            },
                         },
                     },
-                })
+                    this.#context.signal,
+                )
                 rows.push(...(result.Responses?.[tableName] ?? []).map(item => rowOf(item)))
                 const unprocessed = result.UnprocessedKeys?.[tableName]?.Keys ?? []
                 if (unprocessed.length === 0) {
@@ -383,7 +425,7 @@ class Connection {
                         `Reading ${unprocessed.length.toString()} of ${refs.length.toString()} keys of table ${tableName} kept being throttled.`,
                     )
                 }
-                await backoff(attempt)
+                await backoff(attempt, this.#context.signal)
                 keys = unprocessed
             } catch (e) {
                 // A table that does not exist yet holds none of the documents.
@@ -409,33 +451,38 @@ class Connection {
                 throw conflict()
             }
             if (isThrottledTransaction(reasons) && attempt < throttleAttemptsMax) {
-                await backoff(attempt)
+                await backoff(attempt, this.#context.signal)
                 return
             }
             throw e
         }
         const limit = exceededLimit(e)
         if (limit) {
-            throw new Error(
-                `Transaction of ${String(items.length)} operations on ${[...new Set(items.map(item => `'${item.table}'`))].join(', ')} exceeds the ${limit}.`,
-            )
+            throw transactionTooLarge(items, limit)
         }
         if (isErrorType(e, 'TransactionInProgressException') && attempt < throttleAttemptsMax) {
-            await backoff(attempt)
+            await backoff(attempt, this.#context.signal)
+            return
+        }
+        // Nobody knows whether it was applied. The request carries the same
+        // token on every attempt, so sending it again applies it at most once;
+        // it is never a conflict, which would have the store write it anew.
+        if (isUnanswered(e) && attempt < throttleAttemptsMax) {
+            await backoff(attempt, this.#context.signal)
             return
         }
         if (isErrorType(e, 'ResourceNotFoundException') && attempt < tableCreationAttemptsMax) {
             for (const table of new Set(items.map(item => item.table))) {
                 await this.#createTable(table)
             }
-            await setTimeout(tableCreationDelayMs)
+            await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
             return
         }
         if (isErrorType(e, 'ResourceInUseException') && attempt < tableCreationAttemptsMax) {
             this.#context.log?.debug('Table in use; retrying assuming it is being created.', e, {
                 tables: [...new Set(items.map(item => item.table))].join(','),
             })
-            await setTimeout(tableCreationDelayMs)
+            await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
             return
         }
         throw e
@@ -505,15 +552,20 @@ class Connection {
         }
     }
 
-    async #request<T>(target: string, body: unknown): Promise<T> {
+    // `signal` is given for reads only; see RequestOptions.
+    async #request<T>(target: string, body: unknown, signal?: AbortSignal): Promise<T> {
         for (let attempt = 1; ; attempt++) {
             try {
-                return await dbRequest<T>(this.#context.env, target, body)
+                return await dbRequest<T>(this.#context.env, target, body, {
+                    signal,
+                    timeoutMs: this.#requestTimeoutMs,
+                    requestsInFlightMax: this.requestsInFlightMax,
+                })
             } catch (e) {
                 if (throttleAttemptsMax <= attempt || !isThrottledRequest(e)) {
                     throw e
                 }
-                await backoff(attempt)
+                await backoff(attempt, this.#context.signal)
             }
         }
     }
@@ -577,7 +629,7 @@ class Connection {
                 ) {
                     throw e
                 }
-                await setTimeout(tableCreationDelayMs)
+                await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
             }
         }
     }
@@ -594,7 +646,7 @@ class Connection {
             if (tableCreationAttemptsMax <= attempt) {
                 throw new Error(`Table ${this.#tableName(table)} did not become active.`)
             }
-            await setTimeout(tableCreationDelayMs)
+            await setTimeout(tableCreationDelayMs, undefined, { signal: this.#context.signal })
         }
     }
 
@@ -943,9 +995,9 @@ const none = () => false
 
 // Equal jitter. Attempts 1-7 sleep about 7 seconds in total, past the 5 seconds DynamoDB
 // says must elapse before a retry can complete a TransactionInProgressException inline.
-async function backoff(attempt: number) {
+async function backoff(attempt: number, signal: AbortSignal | undefined) {
     const delayMs = Math.min(backoffDelayMsMax, backoffDelayMsBase * 2 ** (attempt - 1))
-    await setTimeout(delayMs / 2 + Math.random() * (delayMs / 2))
+    await setTimeout(delayMs / 2 + Math.random() * (delayMs / 2), undefined, { signal })
 }
 
 function conflict() {
@@ -961,6 +1013,33 @@ function isThrottledRequest(error: unknown) {
         isErrorType(error, 'ProvisionedThroughputExceededException') ||
         isErrorType(error, 'ThrottlingException') ||
         isErrorType(error, 'RequestLimitExceeded')
+    )
+}
+
+function isUnanswered(error: unknown) {
+    if (!Error.isError(error)) {
+        return false
+    }
+    if ('unanswered' in error) {
+        return true
+    }
+    return 'response' in error && statusOf(error.response) >= 500
+}
+
+function statusOf(response: unknown) {
+    if (typeof response !== 'object' || response === null || !('status' in response)) {
+        return 0
+    }
+    return typeof response.status === 'number' ? response.status : 0
+}
+
+// Recognized by `isTransactionTooLarge` of @movogo-io/docs by its code.
+function transactionTooLarge(items: TransactionItem[], limit: string) {
+    return Object.assign(
+        new Error(
+            `Transaction of ${String(items.length)} operations on ${[...new Set(items.map(item => `'${item.table}'`))].join(', ')} exceeds the ${limit}.`,
+        ),
+        { code: 'docs.transaction_too_large' },
     )
 }
 

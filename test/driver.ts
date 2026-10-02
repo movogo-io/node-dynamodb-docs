@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { createServer, type IncomingHttpHeaders } from 'node:http'
+import { createServer, type IncomingHttpHeaders, type ServerResponse } from 'node:http'
+import { setTimeout } from 'node:timers/promises'
 import { isConflict } from '@movogo-io/docs'
 import { setDriver } from '@movogo-io/docs/driver'
 import { docs } from '@movogo-io/docs/indexed'
@@ -203,7 +204,7 @@ describe('driver', () => {
         }
     })
 
-    it('reads the refusal of a transaction over 100 items, which DynamoDB mislabels as compressed', async () => {
+    it('reads the refusal of a transaction DynamoDB counts over 100 items, which it mislabels as compressed', async () => {
         const echoedItems = Array.from(
             { length: 101 },
             (_, i) =>
@@ -232,7 +233,7 @@ describe('driver', () => {
 
             await assert.rejects(
                 connection.transact(
-                    Array.from({ length: 101 }, (_, i) => ({
+                    Array.from({ length: 100 }, (_, i) => ({
                         op: 'add',
                         table: 'Docs',
                         partition: 'p',
@@ -245,8 +246,11 @@ describe('driver', () => {
                 (e: unknown) => {
                     assert.deepStrictEqual(
                         e,
-                        new Error(
-                            "Transaction of 101 operations on 'Docs' exceeds the limit of 100 operations per transaction.",
+                        Object.assign(
+                            new Error(
+                                "Transaction of 100 operations on 'Docs' exceeds the limit of 100 operations per transaction.",
+                            ),
+                            { code: 'docs.transaction_too_large' },
                         ),
                     )
                     return true
@@ -310,6 +314,133 @@ describe('driver', () => {
                     return true
                 },
             )
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('opens no more connections than its bound, however many requests are in flight', async () => {
+        const mock = await createMockDynamo(async (target, headers) => {
+            await setTimeout(5)
+            return mockResponse(target, headers)
+        })
+        try {
+            const connection = await new Driver({ requestsInFlightMax: 4 }).connect({
+                env: mockEnv(mock.baseUrl),
+            })
+
+            const rows = await Promise.all(
+                Array.from({ length: 100 }, (_, i) => connection.get('Docs', 'p', `k${String(i)}`)),
+            )
+
+            assert.strictEqual(rows.length, 100)
+            assert.strictEqual(mock.connections.opened, 4)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('declares its bound on requests in flight and its transaction limit', async () => {
+        const bounded = await new Driver({ requestsInFlightMax: 8 }).connect({ env: mockEnv('') })
+        const plain = await new Driver().connect({ env: mockEnv('') })
+
+        assert.strictEqual(bounded.requestsInFlightMax, 8)
+        assert.strictEqual(plain.requestsInFlightMax, 16)
+        assert.strictEqual(bounded.transactionItemsMax, 100)
+    })
+
+    it('gives up a request that is not answered in time', async () => {
+        const mock = await createMockDynamo(neverAnswered)
+        try {
+            const connection = await new Driver({ requestTimeoutMs: 50 }).connect({
+                env: mockEnv(mock.baseUrl),
+            })
+
+            await assert.rejects(connection.get('Docs', 'p', 'k'), {
+                message: 'DynamoDB did not answer within 50 ms.',
+                unanswered: true,
+            })
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('aborts a read with the signal of the context, and leaves a write to finish', async () => {
+        const mock = await createMockDynamo()
+        try {
+            const connection = await new Driver().connect({
+                env: mockEnv(mock.baseUrl),
+                signal: AbortSignal.abort(),
+            })
+
+            await assert.rejects(connection.get('Docs', 'p', 'k'), { name: 'AbortError' })
+            await connection.delete('Docs', 'p', 'k', 'r', { now })
+
+            assert.deepStrictEqual(
+                mock.requests.map(request => request.target),
+                ['DynamoDB_20120810.DeleteItem'],
+            )
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('sends a transaction again under the same token when its reply is lost', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 500,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#InternalServerError',
+                        message: 'Internal server error',
+                    },
+                }
+            }
+            return { status: 200, body: {} }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await connection.transact(
+                [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                { now },
+            )
+
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(tokens.length, 2)
+            assert.strictEqual(tokens[0], tokens[1])
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('refuses more operations than a transaction takes before sending any', async () => {
+        const mock = await createMockDynamo()
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    Array.from({ length: 101 }, (_, i) => ({
+                        op: 'check',
+                        table: 'Docs',
+                        partition: 'p',
+                        key: `k${String(i)}`,
+                        revision: 'r',
+                    })),
+                    { now },
+                ),
+                {
+                    message:
+                        "Transaction of 101 operations on 'Docs' exceeds the limit of 100 operations per transaction.",
+                    code: 'docs.transaction_too_large',
+                },
+            )
+            assert.deepStrictEqual(mock.requests, [])
         } finally {
             await mock.close()
         }
@@ -1028,6 +1159,16 @@ async function rawItem(partition: string, key: string) {
     }
 }
 
+function mockEnv(baseUrl: string) {
+    return {
+        AWS_REGION: 'eu-north-1',
+        AWS_ACCESS_KEY_ID: 'mock',
+        AWS_SECRET_ACCESS_KEY: 'mock',
+        AWS_DYNAMODB_ENDPOINT: baseUrl,
+        TABLE_PREFIX: 'Mock.',
+    }
+}
+
 // Every item of the partition as DynamoDB holds it, whatever its attributes.
 async function rawPartition(partition: string) {
     const { Items } = await dbRequest<{ Items?: { key?: { S: string } }[] }>(context.env, 'Query', {
@@ -1041,9 +1182,17 @@ async function rawPartition(partition: string) {
 }
 
 // Answers every read with an empty result and records what was asked, so a
-// test can see the request shape; nothing here reaches a real account.
-async function createMockDynamo(respond = mockResponse) {
+// test can see the request shape; nothing here reaches a real account. A
+// responder may answer later, or never: `close` drops what is still open.
+async function createMockDynamo(
+    respond: (
+        target: string | string[] | undefined,
+        headers: IncomingHttpHeaders,
+    ) => MockResponse | Promise<MockResponse> = mockResponse,
+) {
     const requests: { target: string | string[] | undefined; body: unknown }[] = []
+    const replies: Promise<void>[] = []
+    const connections = { opened: 0 }
     const server = await new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
         const s = createServer((req, res) => {
             req.setEncoding('utf-8')
@@ -1053,13 +1202,11 @@ async function createMockDynamo(respond = mockResponse) {
             })
             req.on('end', () => {
                 requests.push({ target: req.headers['x-amz-target'], body: JSON.parse(body) })
-                const response = respond(req.headers['x-amz-target'], req.headers)
-                res.writeHead(response.status, {
-                    'content-type': 'application/json',
-                    ...response.headers,
-                })
-                res.end(JSON.stringify(response.body))
+                replies.push(reply(res, respond(req.headers['x-amz-target'], req.headers)))
             })
+        })
+        s.on('connection', () => {
+            connections.opened += 1
         })
         s.on('error', reject)
         s.listen(0, '127.0.0.1', () => {
@@ -1073,8 +1220,10 @@ async function createMockDynamo(respond = mockResponse) {
     return {
         baseUrl: `http://127.0.0.1:${address.port.toString()}/`,
         requests,
+        connections,
         close: () =>
             new Promise<void>((resolve, reject) => {
+                server.closeAllConnections()
                 server.close(err => {
                     if (err) {
                         reject(err)
@@ -1086,10 +1235,28 @@ async function createMockDynamo(respond = mockResponse) {
     }
 }
 
+type MockResponse = { status: number; headers?: { [name: string]: string }; body: unknown }
+
+async function reply(res: ServerResponse, response: MockResponse | Promise<MockResponse>) {
+    try {
+        const { status, headers, body } = await response
+        res.writeHead(status, { 'content-type': 'application/json', ...headers })
+        res.end(JSON.stringify(body))
+    } catch (e) {
+        res.destroy(Error.isError(e) ? e : undefined)
+    }
+}
+
+function neverAnswered() {
+    return new Promise<MockResponse>(() => {
+        // Left pending: the request is never answered.
+    })
+}
+
 function mockResponse(
     target: string | string[] | undefined,
     _headers: IncomingHttpHeaders,
-): { status: number; headers?: { [name: string]: string }; body: unknown } {
+): MockResponse {
     if (target === 'DynamoDB_20120810.GetItem') {
         return {
             status: 200,
