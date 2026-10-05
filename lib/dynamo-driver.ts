@@ -878,11 +878,11 @@ function liveRevisionCondition(revision: unknown, nowSeconds: number) {
 }
 
 // Reads are eventually consistent unless the service opts in for all of them:
-// a strongly consistent read costs twice the read units, and only a read that
-// looks at a row written milliseconds earlier and decides on what it sees
-// needs it. The env var is the service-wide override; a caller that needs one
-// such read asks per call with `{ consistent: true }`. A revision-fenced write
-// stays correct either way; a stale read just conflicts and retries.
+// a strongly consistent read costs twice the read units, and the store asks
+// for one per call, with `{ consistent: true }`, wherever a stale answer would
+// be acted on unchecked. The env var is the service-wide override. Under it a
+// read that finds no row is made twice: the store confirms an absence
+// consistently and cannot tell this one already was.
 function consistentReads(env: Environment | undefined) {
     const consistency = env?.AWS_DYNAMODB_READ_CONSISTENCY ?? 'EVENTUAL'
     if (consistency === 'STRONG') {
