@@ -417,7 +417,460 @@ describe('driver', () => {
         } finally {
             await mock.close()
         }
+    }).timeout(5000)
+
+    it('sees a transaction cancelled for a failed condition as a conflict, without retrying', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                message:
+                    'Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed, TransactionConflict]',
+                CancellationReasons: [
+                    { Code: 'ConditionalCheckFailed', Message: 'The conditional request failed' },
+                    {
+                        Code: 'TransactionConflict',
+                        Message: 'Transaction is ongoing for the item',
+                    },
+                ],
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [
+                        { op: 'check', table: 'Docs', partition: 'p', key: 'k1', revision: 'r' },
+                        { op: 'check', table: 'Docs', partition: 'p', key: 'k2', revision: 'r' },
+                    ],
+                    { now },
+                ),
+                isConflict,
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
     })
+
+    it('sends a transaction that lost a race again under a new token', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                        message:
+                            'Transaction cancelled, please refer cancellation reasons for specific reasons [None, TransactionConflict]',
+                        CancellationReasons: [
+                            { Code: 'None' },
+                            {
+                                Code: 'TransactionConflict',
+                                Message: 'Transaction is ongoing for the item',
+                            },
+                        ],
+                    },
+                }
+            }
+            return { status: 200, body: {} }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await connection.transact(
+                [
+                    { op: 'check', table: 'Docs', partition: 'p', key: 'k1', revision: 'r' },
+                    { op: 'check', table: 'Docs', partition: 'p', key: 'k2', revision: 'r' },
+                ],
+                { now },
+            )
+
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(tokens.length, 2)
+            assert.notStrictEqual(tokens[0], tokens[1])
+            assert.deepStrictEqual(
+                (mock.requests[1]?.body as { TransactItems: unknown }).TransactItems,
+                (mock.requests[0]?.body as { TransactItems: unknown }).TransactItems,
+            )
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
+
+    it('resends a lost reply under its token and a lost race under a new one', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 500,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#InternalServerError',
+                        message: 'Internal server error',
+                    },
+                }
+            }
+            if (requested === 2) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                        message:
+                            'Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]',
+                        CancellationReasons: [
+                            {
+                                Code: 'TransactionConflict',
+                                Message: 'Transaction is ongoing for the item',
+                            },
+                        ],
+                    },
+                }
+            }
+            return { status: 200, body: {} }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await connection.transact(
+                [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                { now },
+            )
+
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(tokens.length, 3)
+            assert.strictEqual(tokens[0], tokens[1])
+            assert.notStrictEqual(tokens[1], tokens[2])
+            assert.deepStrictEqual(
+                (mock.requests[2]?.body as { TransactItems: unknown }).TransactItems,
+                (mock.requests[0]?.body as { TransactItems: unknown }).TransactItems,
+            )
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
+
+    it('sees a race lost on every attempt as a conflict', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                message:
+                    'Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]',
+                CancellationReasons: [
+                    { Code: 'TransactionConflict', Message: 'Transaction is ongoing for the item' },
+                ],
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                    { now },
+                ),
+                isConflict,
+            )
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(new Set(tokens).size, 4)
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
+
+    it('sees a transaction cancelled without reasons it can read as an error, without retrying', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                message: 'Transaction cancelled',
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                    { now },
+                ),
+                (e: unknown) => {
+                    assert.deepStrictEqual(
+                        e,
+                        Object.assign(new Error('Error fetching DynamoDB'), {
+                            response: {
+                                url: mock.baseUrl,
+                                status: 400,
+                                body: JSON.stringify({
+                                    __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                                    message: 'Transaction cancelled',
+                                }),
+                            },
+                            target: 'DynamoDB_20120810.TransactWriteItems',
+                        }),
+                    )
+                    return true
+                },
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('sees a transaction cancelled for reasons without a code as an error, without retrying', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                message: 'Transaction cancelled',
+                CancellationReasons: [{ Message: 'Something unforeseen' }],
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                    { now },
+                ),
+                { message: 'Error fetching DynamoDB' },
+            )
+            assert.strictEqual(mock.requests.length, 1)
+        } finally {
+            await mock.close()
+        }
+    })
+
+    it('sees a check that fails once a lost race is decided as a conflict', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                        message:
+                            'Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]',
+                        CancellationReasons: [
+                            {
+                                Code: 'TransactionConflict',
+                                Message: 'Transaction is ongoing for the item',
+                            },
+                        ],
+                    },
+                }
+            }
+            return {
+                status: 400,
+                body: {
+                    __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                    message:
+                        'Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]',
+                    CancellationReasons: [
+                        {
+                            Code: 'ConditionalCheckFailed',
+                            Message: 'The conditional request failed',
+                        },
+                    ],
+                },
+            }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                    { now },
+                ),
+                isConflict,
+            )
+            assert.strictEqual(mock.requests.length, 2)
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
+
+    it('sends a transaction that lost a race while throttled again under a new token', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                        message:
+                            'Transaction cancelled, please refer cancellation reasons for specific reasons [ThrottlingError, TransactionConflict, ProvisionedThroughputExceeded]',
+                        CancellationReasons: [
+                            {
+                                Code: 'ThrottlingError',
+                                Message:
+                                    'Throughput exceeds the current capacity of your table or index.',
+                            },
+                            {
+                                Code: 'TransactionConflict',
+                                Message: 'Transaction is ongoing for the item',
+                            },
+                            {
+                                Code: 'ProvisionedThroughputExceeded',
+                                Message:
+                                    'The level of configured provisioned throughput for the table was exceeded.',
+                            },
+                        ],
+                    },
+                }
+            }
+            return { status: 200, body: {} }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await connection.transact(
+                [
+                    { op: 'check', table: 'Docs', partition: 'p', key: 'k1', revision: 'r' },
+                    { op: 'check', table: 'Docs', partition: 'p', key: 'k2', revision: 'r' },
+                    { op: 'check', table: 'Docs', partition: 'p', key: 'k3', revision: 'r' },
+                ],
+                { now },
+            )
+
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(tokens.length, 2)
+            assert.notStrictEqual(tokens[0], tokens[1])
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
+
+    it('counts the resends after a lost race against the attempts of the call', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                        message:
+                            'Transaction cancelled, please refer cancellation reasons for specific reasons [TransactionConflict]',
+                        CancellationReasons: [
+                            {
+                                Code: 'TransactionConflict',
+                                Message: 'Transaction is ongoing for the item',
+                            },
+                        ],
+                    },
+                }
+            }
+            return {
+                status: 500,
+                body: {
+                    __type: 'com.amazonaws.dynamodb.v20120810#InternalServerError',
+                    message: 'Internal server error',
+                },
+            }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [{ op: 'check', table: 'Docs', partition: 'p', key: 'k', revision: 'r' }],
+                    { now },
+                ),
+                (e: unknown) => {
+                    assert.deepStrictEqual(
+                        e,
+                        Object.assign(new Error('Error fetching DynamoDB'), {
+                            response: {
+                                url: mock.baseUrl,
+                                status: 500,
+                                body: JSON.stringify({
+                                    __type: 'com.amazonaws.dynamodb.v20120810#InternalServerError',
+                                    message: 'Internal server error',
+                                }),
+                            },
+                            target: 'DynamoDB_20120810.TransactWriteItems',
+                        }),
+                    )
+                    return true
+                },
+            )
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(tokens.length, 8)
+            assert.notStrictEqual(tokens[0], tokens[1])
+            assert.strictEqual(new Set(tokens.slice(1)).size, 1)
+        } finally {
+            await mock.close()
+        }
+    }).timeout(15_000)
+
+    it('sends a write that lost a race to a transaction again', async () => {
+        let requested = 0
+        const mock = await createMockDynamo(() => {
+            ++requested
+            if (requested === 1) {
+                return {
+                    status: 400,
+                    body: {
+                        __type: 'com.amazonaws.dynamodb.v20120810#TransactionConflictException',
+                        message: 'Transaction is ongoing for the item',
+                    },
+                }
+            }
+            return { status: 200, body: {} }
+        })
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await connection.delete('Docs', 'p', 'k', 'r', { now })
+
+            assert.deepStrictEqual(
+                mock.requests.map(request => request.target),
+                ['DynamoDB_20120810.DeleteItem', 'DynamoDB_20120810.DeleteItem'],
+            )
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
+
+    it('sees a write that lost a race to a transaction on every attempt as a conflict', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazonaws.dynamodb.v20120810#TransactionConflictException',
+                message: 'Transaction is ongoing for the item',
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.update('Docs', 'p', 'k', 'r', {}, { now, newRevision: 'r2' }),
+                isConflict,
+            )
+            assert.strictEqual(mock.requests.length, 4)
+        } finally {
+            await mock.close()
+        }
+    }).timeout(5000)
 
     it('refuses more operations than a transaction takes before sending any', async () => {
         const mock = await createMockDynamo()
@@ -498,12 +951,88 @@ describe('driver', () => {
             )
 
             assert.strictEqual(requested, 2)
+            const tokens = mock.requests
+                .filter(request => request.target === 'DynamoDB_20120810.TransactWriteItems')
+                .map(request => (request.body as { ClientRequestToken: string }).ClientRequestToken)
+            assert.strictEqual(tokens[0], tokens[1])
         } finally {
             await mock.close()
         }
-    })
+    }).timeout(5000)
 
-    it('sees a lost race in a transaction of many items as a conflict', async () => {
+    it('sees a transaction throttled on every attempt as throttled, under one token', async () => {
+        const mock = await createMockDynamo(() => ({
+            status: 400,
+            body: {
+                __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                message:
+                    'Transaction cancelled, please refer cancellation reasons for specific reasons [ThrottlingError, ProvisionedThroughputExceeded]',
+                CancellationReasons: [
+                    {
+                        Code: 'ThrottlingError',
+                        Message: 'Throughput exceeds the current capacity of your table or index.',
+                    },
+                    {
+                        Code: 'ProvisionedThroughputExceeded',
+                        Message:
+                            'The level of configured provisioned throughput for the table was exceeded.',
+                    },
+                ],
+            },
+        }))
+        try {
+            const connection = await new Driver().connect({ env: mockEnv(mock.baseUrl) })
+
+            await assert.rejects(
+                connection.transact(
+                    [
+                        { op: 'check', table: 'Docs', partition: 'p', key: 'k1', revision: 'r' },
+                        { op: 'check', table: 'Docs', partition: 'p', key: 'k2', revision: 'r' },
+                    ],
+                    { now },
+                ),
+                (e: unknown) => {
+                    assert.deepStrictEqual(
+                        e,
+                        Object.assign(new Error('Error fetching DynamoDB'), {
+                            response: {
+                                url: mock.baseUrl,
+                                status: 400,
+                                body: JSON.stringify({
+                                    __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException',
+                                    message:
+                                        'Transaction cancelled, please refer cancellation reasons for specific reasons [ThrottlingError, ProvisionedThroughputExceeded]',
+                                    CancellationReasons: [
+                                        {
+                                            Code: 'ThrottlingError',
+                                            Message:
+                                                'Throughput exceeds the current capacity of your table or index.',
+                                        },
+                                        {
+                                            Code: 'ProvisionedThroughputExceeded',
+                                            Message:
+                                                'The level of configured provisioned throughput for the table was exceeded.',
+                                        },
+                                    ],
+                                }),
+                            },
+                            target: 'DynamoDB_20120810.TransactWriteItems',
+                        }),
+                    )
+                    return true
+                },
+            )
+            const tokens = mock.requests.map(
+                request => (request.body as { ClientRequestToken: string }).ClientRequestToken,
+            )
+            assert.strictEqual(tokens.length, 8)
+            assert.strictEqual(new Set(tokens).size, 1)
+        } finally {
+            await mock.close()
+        }
+    }).timeout(15_000)
+
+    it('sees a failed check in a transaction of many items as a conflict', async () => {
         const connection = await new Driver().connect(context)
         const partition = randomUUID()
 

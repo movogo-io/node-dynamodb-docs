@@ -46,6 +46,10 @@ type Environment = {
 }
 
 const throttleAttemptsMax = 8
+// A write that lost a race to a transaction on one of its items applied
+// nothing; the race lasts as long as the other transaction, so a few attempts
+// see it decided, and a stale revision then conflicts for real.
+const transactionConflictAttemptsMax = 4
 // TransactWriteItems takes at most 100 operations.
 const transactionItemsMax = 100
 // BatchGetItem reads at most 100 keys, and answers at most 16MB; whatever it
@@ -125,8 +129,8 @@ class Connection {
             if (isErrorType(e, 'ConditionalCheckFailedException')) {
                 throw conflict()
             }
-            // A transaction holds the item; the revision this write assumes, or the
-            // absence it asserts, is about to be stale.
+            // A transaction kept holding the item past every attempt; the revision
+            // this write assumes, or the absence it asserts, is about to be stale.
             if (isErrorType(e, 'TransactionConflictException')) {
                 throw conflict()
             }
@@ -371,17 +375,24 @@ class Connection {
             throw transactionTooLarge(items, 'limit of 100 operations per transaction')
         }
         const timestamp = isoOf(options.now)
-        const request = {
-            TransactItems: items.map(item => this.#transactItem(item, options.now, timestamp)),
-            ClientRequestToken: randomUUID(),
-        }
-        for (let attempt = 1; ; attempt++) {
-            try {
-                await this.#request('TransactWriteItems', request)
+        const transactItems = items.map(item => this.#transactItem(item, options.now, timestamp))
+        // A lost race applied nothing, so it is sent anew, under a token of its
+        // own: the token only spans resends of one request whose reply was lost.
+        // The attempts run on across tokens, so a race restarts no budget.
+        for (let race = 1, attempt = 1; ; race++) {
+            const raceLostAt = await this.#raceLostAt(transactItems, items, randomUUID(), attempt)
+            if (raceLostAt === undefined) {
                 return
-            } catch (e) {
-                await this.#recoverTransaction(e, items, attempt)
             }
+            if (transactionConflictAttemptsMax <= race) {
+                throw conflict()
+            }
+            this.#context.log?.debug('Transaction lost a race; sending it again.', undefined, {
+                tables: [...new Set(items.map(item => item.table))].join(','),
+                race,
+            })
+            await backoff(race, this.#context.signal)
+            attempt = raceLostAt + 1
         }
     }
 
@@ -439,6 +450,30 @@ class Connection {
                     return []
                 }
                 throw e
+            }
+        }
+    }
+
+    // Sends the transaction under one token until DynamoDB answers it, and
+    // answers the attempt cancelled only for racing another transaction, if any.
+    async #raceLostAt(
+        transactItems: unknown[],
+        items: TransactionItem[],
+        token: string,
+        attemptFirst: number,
+    ) {
+        for (let attempt = attemptFirst; ; attempt++) {
+            try {
+                await this.#request('TransactWriteItems', {
+                    TransactItems: transactItems,
+                    ClientRequestToken: token,
+                })
+                return undefined
+            } catch (e) {
+                if (isLostRace(e)) {
+                    return attempt
+                }
+                await this.#recoverTransaction(e, items, attempt)
             }
         }
     }
@@ -565,7 +600,7 @@ class Connection {
                     requestsInFlightMax: this.requestsInFlightMax,
                 })
             } catch (e) {
-                if (throttleAttemptsMax <= attempt || !isThrottledRequest(e)) {
+                if (!isRetried(e, attempt)) {
                     throw e
                 }
                 await backoff(attempt, this.#context.signal)
@@ -1011,6 +1046,17 @@ function notFound() {
     return Object.assign(new Error('Not found'), { status: 404, statusCode: 404 })
 }
 
+// A plain write that lost a race to a transaction applied nothing either.
+function isRetried(error: unknown, attempt: number) {
+    if (isThrottledRequest(error)) {
+        return attempt < throttleAttemptsMax
+    }
+    if (isErrorType(error, 'TransactionConflictException')) {
+        return attempt < transactionConflictAttemptsMax
+    }
+    return false
+}
+
 function isThrottledRequest(error: unknown) {
     return (
         isErrorType(error, 'ProvisionedThroughputExceededException') ||
@@ -1096,6 +1142,23 @@ function messageOf(error: unknown) {
     const { response } = error as { response: { body: string } }
     const body = JSON.parse(response.body) as { message?: string }
     return body.message ?? ''
+}
+
+// Cancelled for racing another transaction, which holds an item, even one
+// that fails itself, and at most throttled besides: no condition failed, so
+// this transaction is no verdict on what is stored.
+function isLostRace(error: unknown) {
+    const codes = (cancellationReasons(error) ?? []).map(r => r.Code)
+    return (
+        codes.includes('TransactionConflict') &&
+        codes.every(
+            code =>
+                code === 'None' ||
+                code === 'TransactionConflict' ||
+                code === 'ThrottlingError' ||
+                code === 'ProvisionedThroughputExceeded',
+        )
+    )
 }
 
 function isThrottledTransaction(reasons: { Code?: string }[]) {
